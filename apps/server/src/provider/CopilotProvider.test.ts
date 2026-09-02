@@ -60,6 +60,16 @@ function versionSpawner(result = { stdout: "GitHub Copilot CLI 1.0.80\n", stderr
   );
 }
 
+function unusedSession(operation: string) {
+  return Effect.fail(
+    new CopilotSdkRuntimeError({
+      operation,
+      kind: "failure",
+      detail: "not used by provider discovery tests",
+    }),
+  );
+}
+
 function runtimeLayer(input: {
   readonly auth?: Effect.Effect<GetAuthStatusResponse, CopilotSdkRuntimeError>;
   readonly models?: Effect.Effect<ReadonlyArray<ModelInfo>, CopilotSdkRuntimeError>;
@@ -76,14 +86,8 @@ function runtimeLayer(input: {
           return {
             authStatus: input.auth ?? Effect.succeed(authenticated),
             models: input.models ?? Effect.succeed(inventory),
-            createSession: () =>
-              Effect.fail(
-                new CopilotSdkRuntimeError({
-                  operation: "createSession",
-                  kind: "failure",
-                  detail: "not used by provider discovery tests",
-                }),
-              ),
+            createSession: () => unusedSession("createSession"),
+            resumeSession: () => unusedSession("resumeSession"),
           };
         }),
         () => Effect.sync(() => input.stops?.push(1)),

@@ -6,7 +6,9 @@ import {
   type ModelInfo,
   type PermissionRequest,
   type PermissionRequestResult,
+  type ResumeSessionConfig,
   type SessionConfig,
+  type SessionConfigBase,
   type SessionEvent,
 } from "@github/copilot-sdk";
 import * as Context from "effect/Context";
@@ -16,6 +18,10 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 import { resolveCopilotExecutable } from "./CopilotExecutable.ts";
+
+/** The SDK does not re-export these unions from its entrypoint. */
+type ReasoningEffort = NonNullable<SessionConfigBase["reasoningEffort"]>;
+type ContextTier = NonNullable<SessionConfigBase["contextTier"]>;
 
 const DEFAULT_START_TIMEOUT_MS = 8_000;
 const STOP_TIMEOUT_MS = 2_000;
@@ -114,13 +120,51 @@ export interface CopilotSdkConnection {
   readonly createSession: (
     input: CopilotSdkSessionStartInput,
   ) => Effect.Effect<CopilotSdkSession, CopilotSdkRuntimeError>;
+  /**
+   * Re-attaches to a remote session the runtime still holds on disk. Fails
+   * when the id is unknown, so a stale cursor can never present itself as a
+   * successful resume.
+   */
+  readonly resumeSession: (
+    input: CopilotSdkSessionResumeInput,
+  ) => Effect.Effect<CopilotSdkSession, CopilotSdkRuntimeError>;
+}
+
+/** Model and per-model settings the runtime accepts at start, resume, and switch. */
+export interface CopilotSdkModelOptions {
+  readonly model: string;
+  readonly reasoningEffort?: ReasoningEffort;
+  readonly contextTier?: ContextTier;
 }
 
 export interface CopilotSdkSessionStartInput {
   readonly workingDirectory: string;
-  readonly model?: string;
+  readonly modelOptions?: CopilotSdkModelOptions;
   readonly onEvent: (event: SessionEvent) => void;
   readonly onPermissionRequest: (request: unknown) => Promise<PermissionRequestResult>;
+}
+
+export interface CopilotSdkSessionResumeInput extends CopilotSdkSessionStartInput {
+  readonly sessionId: string;
+}
+
+/** One user turn the runtime can rewind to, oldest first. */
+export interface CopilotSdkRewindPoint {
+  readonly eventId: string;
+  readonly userMessage: string;
+  readonly timestamp: string;
+}
+
+export interface CopilotSdkRewindPoints {
+  readonly points: ReadonlyArray<CopilotSdkRewindPoint>;
+  /** Set when the runtime cannot answer the read at all (busy, remote session). */
+  readonly unavailableReason?: string;
+}
+
+export interface CopilotSdkRewindResult {
+  readonly outcome: string;
+  readonly eventsRemoved?: number;
+  readonly error?: string;
 }
 
 export interface CopilotSdkSession {
@@ -128,6 +172,14 @@ export interface CopilotSdkSession {
   readonly send: (input: MessageOptions) => Effect.Effect<string, CopilotSdkRuntimeError>;
   /** Aborts the message the session is currently processing. The session stays usable. */
   readonly abort: Effect.Effect<void, CopilotSdkRuntimeError>;
+  /** Applies a model change to the live session; it takes effect on the next message. */
+  readonly setModel: (
+    options: CopilotSdkModelOptions,
+  ) => Effect.Effect<void, CopilotSdkRuntimeError>;
+  readonly rewindPoints: Effect.Effect<CopilotSdkRewindPoints, CopilotSdkRuntimeError>;
+  readonly rewind: (
+    eventId: string,
+  ) => Effect.Effect<CopilotSdkRewindResult, CopilotSdkRuntimeError>;
   readonly disconnect: Effect.Effect<void, CopilotSdkRuntimeError>;
 }
 
@@ -138,14 +190,47 @@ function wrapSession(
     sessionId: session.sessionId,
     send: (input) => sdkEffect("send", () => session.send(input)),
     abort: sdkEffect("abort", () => session.abort()).pipe(Effect.asVoid),
+    setModel: (options) =>
+      sdkEffect("setModel", () => session.setModel(options.model, modelSettings(options))),
+    rewindPoints: sdkEffect("listRewindPoints", () => session.rpc.history.listRewindPoints()).pipe(
+      Effect.map((result) => ({
+        // Autopilot continuations are turns the runtime injected on its own;
+        // they are not turns a user took, so counting them would shift every
+        // rollback boundary.
+        points: result.points
+          .filter((point) => !point.isAutopilotContinuation)
+          .map((point) => ({
+            eventId: point.eventId,
+            userMessage: point.userMessage,
+            timestamp: point.timestamp,
+          })),
+        ...(result.unavailableReason ? { unavailableReason: result.unavailableReason } : {}),
+      })),
+    ),
+    // Conversation-only: T3 owns workspace restore through its own checkpoints,
+    // so the runtime must never touch files behind our back.
+    rewind: (eventId) =>
+      sdkEffect("rewind", () => session.rpc.history.rewind({ eventId, mode: "conversation" })),
     disconnect: sdkEffect("disconnect", () => session.disconnect()),
   };
 }
 
-function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig {
+/** The per-model settings both session configs and `setModel` accept. */
+function modelSettings(options: CopilotSdkModelOptions | undefined) {
+  if (!options) return {};
+  return {
+    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.contextTier ? { contextTier: options.contextTier } : {}),
+  };
+}
+
+/** Start and resume take the same shape; only the id the runtime looks up differs. */
+function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig & ResumeSessionConfig {
   return {
     workingDirectory: input.workingDirectory,
-    ...(input.model ? { model: input.model } : {}),
+    ...(input.modelOptions
+      ? { model: input.modelOptions.model, ...modelSettings(input.modelOptions) }
+      : {}),
     streaming: true,
     onEvent: input.onEvent,
     onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
@@ -212,6 +297,10 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
         sdkEffect("createSession", () => client.createSession(sessionConfig(input))).pipe(
           Effect.map(wrapSession),
         ),
+      resumeSession: (input) =>
+        sdkEffect("resumeSession", () =>
+          client.resumeSession(input.sessionId, sessionConfig(input)),
+        ).pipe(Effect.map(wrapSession)),
     };
   }),
 };

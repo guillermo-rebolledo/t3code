@@ -1,4 +1,4 @@
-import type { SessionEvent } from "@github/copilot-sdk";
+import type { ModelInfo, SessionEvent } from "@github/copilot-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -23,12 +23,15 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import type {
   CopilotSdkConnection,
+  CopilotSdkModelOptions,
   CopilotSdkRuntimeShape,
   CopilotSdkSession,
+  CopilotSdkSessionResumeInput,
   CopilotSdkSessionStartInput,
 } from "../CopilotSdkRuntime.ts";
 import { CopilotSdkRuntimeError as SdkError } from "../CopilotSdkRuntime.ts";
 import type { CopilotPermission } from "../CopilotPermissions.ts";
+import { buildCopilotContinuation } from "../CopilotContinuation.ts";
 import { makeCopilotAdapter } from "./CopilotAdapter.ts";
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
@@ -42,12 +45,20 @@ function fakeSession(
     readonly abort?: CopilotSdkSession["abort"];
     readonly onAbort?: () => void;
     readonly onDisconnect?: () => void;
+    readonly setModel?: CopilotSdkSession["setModel"];
+    readonly onSetModel?: (modelOptions: CopilotSdkModelOptions) => void;
+    readonly rewindPoints?: CopilotSdkSession["rewindPoints"];
+    readonly rewind?: CopilotSdkSession["rewind"];
   } = {},
 ): CopilotSdkSession {
   return {
     sessionId,
     send: options.send ?? (() => Effect.succeed("message-1")),
     abort: options.abort ?? Effect.sync(() => options.onAbort?.()),
+    setModel:
+      options.setModel ?? ((modelOptions) => Effect.sync(() => options.onSetModel?.(modelOptions))),
+    rewindPoints: options.rewindPoints ?? Effect.succeed({ points: [] }),
+    rewind: options.rewind ?? (() => Effect.succeed({ outcome: "success", eventsRemoved: 0 })),
     disconnect: Effect.sync(() => options.onDisconnect?.()),
   };
 }
@@ -94,12 +105,26 @@ function event<T extends SessionEvent>(value: Omit<T, "id" | "parentId" | "times
 
 function runtimeWith(
   createSession: CopilotSdkConnection["createSession"],
-  options: { readonly onRelease?: () => void } = {},
+  options: {
+    readonly onRelease?: () => void;
+    readonly resumeSession?: CopilotSdkConnection["resumeSession"];
+    readonly models?: CopilotSdkConnection["models"];
+  } = {},
 ): CopilotSdkRuntimeShape {
   const connection: CopilotSdkConnection = {
     authStatus: Effect.succeed({ isAuthenticated: true }),
-    models: Effect.succeed([]),
+    models: options.models ?? Effect.succeed([]),
     createSession,
+    resumeSession:
+      options.resumeSession ??
+      (() =>
+        Effect.fail(
+          new SdkError({
+            operation: "resumeSession",
+            kind: "failure",
+            detail: "resume was not expected in this test",
+          }),
+        )),
   };
   return {
     connect: () =>
@@ -116,6 +141,25 @@ const makeTestAdapter = (
   runtime
     .connect({ binaryPath: "copilot", environment: {}, platform: "darwin" })
     .pipe(Effect.flatMap((connection) => makeCopilotAdapter(connection, options)));
+
+const inventory: ReadonlyArray<ModelInfo> = [
+  {
+    id: "gpt-5.4",
+    name: "GPT-5.4",
+    supportedReasoningEfforts: ["low", "high"],
+    defaultReasoningEffort: "low",
+    capabilities: {
+      supports: { vision: true, reasoningEffort: true },
+      limits: { max_context_window_tokens: 128_000 },
+    },
+  } as ModelInfo,
+];
+
+const rewindPoint = (eventId: string, userMessage: string) => ({
+  eventId,
+  userMessage,
+  timestamp: "2026-01-01T00:00:00.000Z",
+});
 
 const startInput = (threadId: ThreadId, instanceId = ProviderInstanceId.make("copilot_work")) => ({
   threadId,
@@ -1133,6 +1177,347 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
 
       assert.equal(disconnects, 2);
       assert.equal(runtimeReleases, 1);
+    }),
+  );
+  it.effect("resumes the session recorded on the thread and streams its later events", () =>
+    Effect.gen(function* () {
+      const resumeInputs: Array<CopilotSdkSessionResumeInput> = [];
+      let created = 0;
+      const runtime = runtimeWith(
+        () =>
+          Effect.sync(() => {
+            created += 1;
+            return fakeSession("copilot-session-7");
+          }),
+        {
+          resumeSession: (input) =>
+            Effect.sync(() => {
+              resumeInputs.push(input);
+              return fakeSession(input.sessionId, {
+                send: () =>
+                  Effect.sync(() => {
+                    input.onEvent(
+                      event({
+                        type: "assistant.message",
+                        data: { messageId: "resumed-1", content: "Back" },
+                      }),
+                    );
+                    input.onEvent(event({ type: "session.idle", ephemeral: true, data: {} }));
+                    return "resumed-1";
+                  }),
+              });
+            }),
+        },
+      );
+      const instanceId = ProviderInstanceId.make("copilot_work");
+      const threadId = ThreadId.make("resume-thread");
+
+      const before = yield* makeTestAdapter(runtime, { instanceId });
+      const started = yield* before.startSession(startInput(threadId, instanceId));
+
+      // A restarted server rebuilds the adapter and only has the cursor it stored.
+      const after = yield* makeTestAdapter(runtime, { instanceId });
+      const observer = yield* observeEvents(after);
+      const resumed = yield* after.startSession({
+        ...startInput(threadId, instanceId),
+        resumeCursor: started.resumeCursor,
+      });
+      yield* after.sendTurn({ threadId, input: "Where were we?" });
+      const completed = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+
+      assert.equal(created, 1);
+      assert.equal(resumeInputs[0]?.sessionId, "copilot-session-7");
+      assert.deepEqual(resumed.resumeCursor, started.resumeCursor);
+      assert.deepEqual(completed.payload, { state: "completed" });
+      assert.deepEqual(
+        observer.seen.map((runtimeEvent) => runtimeEvent.type),
+        [
+          "session.started",
+          "thread.started",
+          "turn.started",
+          "item.started",
+          "content.delta",
+          "item.completed",
+          "turn.completed",
+        ],
+      );
+    }),
+  );
+
+  it.effect(
+    "reports a session the runtime can no longer resume instead of starting a fresh one",
+    () =>
+      Effect.gen(function* () {
+        let created = 0;
+        const runtime = runtimeWith(
+          () =>
+            Effect.sync(() => {
+              created += 1;
+              return fakeSession("unused-session");
+            }),
+          {
+            resumeSession: () =>
+              Effect.fail(
+                new SdkError({
+                  operation: "resumeSession",
+                  kind: "failure",
+                  detail: "session copilot-session-9 was not found",
+                }),
+              ),
+          },
+        );
+        const instanceId = ProviderInstanceId.make("copilot_work");
+        const adapter = yield* makeTestAdapter(runtime, { instanceId });
+        const threadId = ThreadId.make("missing-remote-session");
+
+        const result = yield* adapter
+          .startSession({
+            ...startInput(threadId, instanceId),
+            resumeCursor: buildCopilotContinuation({ instanceId, sessionId: "copilot-session-9" }),
+          })
+          .pipe(Effect.result);
+
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure._tag, "ProviderAdapterRequestError");
+          assert.include(result.failure.message, "was not found");
+        }
+        assert.equal(created, 0);
+        assert.isFalse(yield* adapter.hasSession(threadId));
+      }),
+  );
+
+  it.effect("refuses continuation metadata it cannot trust", () =>
+    Effect.gen(function* () {
+      let touched = 0;
+      const runtime = runtimeWith(
+        () =>
+          Effect.sync(() => {
+            touched += 1;
+            return fakeSession("unused-session");
+          }),
+        {
+          resumeSession: () =>
+            Effect.sync(() => {
+              touched += 1;
+              return fakeSession("unused-session");
+            }),
+        },
+      );
+      const instanceId = ProviderInstanceId.make("copilot_work");
+      const adapter = yield* makeTestAdapter(runtime, { instanceId });
+
+      const cursors = [
+        { schemaVersion: 0, provider: "copilot", instanceId, sessionId: "stale" },
+        buildCopilotContinuation({
+          instanceId: ProviderInstanceId.make("copilot_personal"),
+          sessionId: "someone-elses",
+        }),
+        "copilot-session-1",
+      ];
+      const failures = yield* Effect.forEach(cursors, (resumeCursor, index) =>
+        adapter
+          .startSession({
+            ...startInput(ThreadId.make(`untrusted-${index}`), instanceId),
+            resumeCursor,
+          })
+          .pipe(Effect.flip),
+      );
+
+      assert.deepEqual(
+        failures.map((failure) => failure._tag),
+        [
+          "ProviderAdapterValidationError",
+          "ProviderAdapterValidationError",
+          "ProviderAdapterValidationError",
+        ],
+      );
+      assert.equal(touched, 0);
+    }),
+  );
+
+  it.effect("applies a supported model and option change before the next turn", () =>
+    Effect.gen(function* () {
+      const switches: Array<CopilotSdkModelOptions> = [];
+      const runtime = runtimeWith(
+        () =>
+          Effect.succeed(
+            fakeSession("model-session", { onSetModel: (value) => switches.push(value) }),
+          ),
+        { models: Effect.succeed(inventory) },
+      );
+      const instanceId = ProviderInstanceId.make("copilot_work");
+      const adapter = yield* makeTestAdapter(runtime, { instanceId });
+      const threadId = ThreadId.make("model-thread");
+      yield* adapter.startSession(startInput(threadId, instanceId));
+
+      const modelSelection = {
+        instanceId,
+        model: "gpt-5.4",
+        options: [{ id: "reasoning_effort", value: "high" }],
+      } as const;
+      yield* adapter.sendTurn({ threadId, input: "First", modelSelection });
+      yield* adapter.sendTurn({ threadId, input: "Second", modelSelection });
+
+      // The switch is applied once and then remembered, so an unchanged
+      // selection does not re-negotiate the model on every turn.
+      assert.deepEqual(switches, [{ model: "gpt-5.4", reasoningEffort: "high" }]);
+      assert.equal((yield* adapter.listSessions())[0]?.model, "gpt-5.4");
+    }),
+  );
+
+  it.effect("fails a turn asking for an unavailable model without starting it", () =>
+    Effect.gen(function* () {
+      const switches: Array<CopilotSdkModelOptions> = [];
+      const runtime = runtimeWith(
+        () =>
+          Effect.succeed(
+            fakeSession("model-failure-session", { onSetModel: (value) => switches.push(value) }),
+          ),
+        { models: Effect.succeed(inventory) },
+      );
+      const instanceId = ProviderInstanceId.make("copilot_work");
+      const adapter = yield* makeTestAdapter(runtime, { instanceId });
+      const threadId = ThreadId.make("model-failure-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, instanceId));
+
+      const missingModel = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Use something else",
+          modelSelection: { instanceId, model: "gpt-9" },
+        })
+        .pipe(Effect.flip);
+      const missingOption = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Think harder",
+          modelSelection: {
+            instanceId,
+            model: "gpt-5.4",
+            options: [{ id: "reasoning_effort", value: "max" }],
+          },
+        })
+        .pipe(Effect.flip);
+
+      // The first turn the adapter accepts is the valid one, so neither refusal
+      // left a started turn behind.
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Carry on",
+        modelSelection: { instanceId, model: "gpt-5.4" },
+      });
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "turn.started");
+
+      assert.equal(missingModel._tag, "ProviderAdapterValidationError");
+      assert.equal(missingOption._tag, "ProviderAdapterValidationError");
+      assert.deepEqual(switches, [{ model: "gpt-5.4" }]);
+      assert.deepEqual(
+        observer.seen.map((runtimeEvent) => runtimeEvent.type),
+        ["session.started", "thread.started", "turn.started"],
+      );
+    }),
+  );
+
+  it.effect("rolls the provider conversation back and returns the truncated snapshot", () =>
+    Effect.gen(function* () {
+      const rewound: Array<string> = [];
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("rewind-session", {
+            rewindPoints: Effect.succeed({
+              points: [rewindPoint("event-1", "First"), rewindPoint("event-2", "Second")],
+            }),
+            rewind: (eventId) =>
+              Effect.sync(() => {
+                rewound.push(eventId);
+                return { outcome: "success", eventsRemoved: 4 };
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("rewind-thread");
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const first = yield* adapter.sendTurn({ threadId, input: "First" });
+      yield* adapter.sendTurn({ threadId, input: "Second" });
+
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
+
+      assert.deepEqual(rewound, ["event-2"]);
+      assert.deepEqual(
+        snapshot.turns.map((turn) => turn.id),
+        [first.turnId],
+      );
+      assert.deepEqual(yield* adapter.readThread(threadId), snapshot);
+    }),
+  );
+
+  it.effect("reports invalid distances and refused rollbacks without dropping history", () =>
+    Effect.gen(function* () {
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("rewind-failure-session", {
+            rewindPoints: Effect.succeed({
+              points: [rewindPoint("event-1", "First"), rewindPoint("event-2", "Second")],
+            }),
+            rewind: () => Effect.succeed({ outcome: "session-busy" }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("rewind-failure-thread");
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      yield* adapter.sendTurn({ threadId, input: "First" });
+      yield* adapter.sendTurn({ threadId, input: "Second" });
+
+      const notATurn = yield* adapter.rollbackThread(threadId, 0).pipe(Effect.flip);
+      const tooFar = yield* adapter.rollbackThread(threadId, 5).pipe(Effect.flip);
+      const refused = yield* adapter.rollbackThread(threadId, 1).pipe(Effect.flip);
+
+      assert.equal(notATurn._tag, "ProviderAdapterValidationError");
+      assert.equal(tooFar._tag, "ProviderAdapterValidationError");
+      assert.equal(refused._tag, "ProviderAdapterRequestError");
+      assert.include(refused.message, "session-busy");
+      assert.lengthOf((yield* adapter.readThread(threadId)).turns, 2);
+    }),
+  );
+  it.effect("rolls a resumed session back using the history the provider still holds", () =>
+    Effect.gen(function* () {
+      const rewound: Array<string> = [];
+      const rewindPoints = Effect.succeed({
+        points: [rewindPoint("event-1", "First"), rewindPoint("event-2", "Second")],
+      });
+      const runtime = runtimeWith(() => Effect.succeed(fakeSession("resumed-rewind-session")), {
+        resumeSession: (input) =>
+          Effect.succeed(
+            fakeSession(input.sessionId, {
+              rewindPoints,
+              rewind: (eventId) =>
+                Effect.sync(() => {
+                  rewound.push(eventId);
+                  return { outcome: "success", eventsRemoved: 6 };
+                }),
+            }),
+          ),
+      });
+      const instanceId = ProviderInstanceId.make("copilot_work");
+      const adapter = yield* makeTestAdapter(runtime, { instanceId });
+      const threadId = ThreadId.make("resumed-rewind-thread");
+      yield* adapter.startSession({
+        ...startInput(threadId, instanceId),
+        resumeCursor: buildCopilotContinuation({ instanceId, sessionId: "copilot-session-3" }),
+      });
+
+      // The restarted adapter holds no turns of its own, so the rollback
+      // boundary can only come from the provider's own history.
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
+
+      assert.deepEqual(rewound, ["event-2"]);
+      assert.isEmpty(snapshot.turns);
     }),
   );
 });
