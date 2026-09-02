@@ -1,9 +1,9 @@
 import type { ModelInfo } from "@github/copilot-sdk";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildCopilotModels } from "./CopilotSdkModels.ts";
+import { buildCopilotModels, resolveCopilotModelOptions } from "./CopilotSdkModels.ts";
 
-const model = (overrides: Partial<ModelInfo>): ModelInfo =>
+const model = (overrides: Partial<ModelInfo> = {}): ModelInfo =>
   ({
     id: "gpt-5.4",
     name: "GPT-5.4",
@@ -56,5 +56,62 @@ describe("buildCopilotModels", () => {
 
   it("never fabricates a model for an empty inventory", () => {
     expect(buildCopilotModels([])).toEqual([]);
+  });
+});
+
+const reasoningModel = () =>
+  model({
+    supportedReasoningEfforts: ["low", "high"],
+    defaultReasoningEffort: "low",
+    capabilities: {
+      supports: { vision: true, reasoningEffort: true },
+      limits: { max_context_window_tokens: 128_000 },
+    },
+  });
+
+describe("resolveCopilotModelOptions", () => {
+  it("maps a supported model and its options onto the runtime settings", () => {
+    const resolved = resolveCopilotModelOptions({
+      model: "gpt-5.4",
+      selections: [{ id: "reasoning_effort", value: "high" }],
+      inventory: [reasoningModel()],
+    });
+
+    expect(resolved).toEqual({
+      kind: "ok",
+      options: { model: "gpt-5.4", reasoningEffort: "high" },
+    });
+  });
+
+  it("refuses a model the account cannot use instead of falling back", () => {
+    const resolved = resolveCopilotModelOptions({
+      model: "gpt-9",
+      inventory: [reasoningModel()],
+    });
+
+    expect(resolved.kind).toBe("invalid");
+    expect(resolved.kind === "invalid" && resolved.issue).toContain("gpt-5.4");
+  });
+
+  it("refuses an option the model does not offer", () => {
+    const resolved = resolveCopilotModelOptions({
+      model: "gpt-5.4",
+      selections: [{ id: "context_tier", value: "long_context" }],
+      inventory: [reasoningModel()],
+    });
+
+    expect(resolved.kind).toBe("invalid");
+    expect(resolved.kind === "invalid" && resolved.issue).toContain("context_tier");
+  });
+
+  it("refuses an unsupported value for an option the model does offer", () => {
+    const resolved = resolveCopilotModelOptions({
+      model: "gpt-5.4",
+      selections: [{ id: "reasoning_effort", value: "max" }],
+      inventory: [reasoningModel()],
+    });
+
+    expect(resolved.kind).toBe("invalid");
+    expect(resolved.kind === "invalid" && resolved.issue).toContain("low, high");
   });
 });

@@ -2,10 +2,12 @@ import type { ModelInfo } from "@github/copilot-sdk";
 import type {
   ModelCapabilities,
   ProviderOptionDescriptor,
+  ProviderOptionSelection,
   ServerProviderModel,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 
+import type { CopilotSdkModelOptions } from "./CopilotSdkRuntime.ts";
 import { buildSelectOptionDescriptor } from "./providerSnapshot.ts";
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({ optionDescriptors: [] });
@@ -75,4 +77,97 @@ export function buildCopilotModels(
     });
   }
   return models.map((model, index) => (index === 0 ? { ...model, isDefault: true } : model));
+}
+
+/** Option ids the provider snapshot advertises, mapped to their SDK fields. */
+const OPTION_FIELDS = {
+  reasoning_effort: "reasoningEffort",
+  context_tier: "contextTier",
+} as const satisfies Record<string, keyof CopilotSdkModelOptions>;
+
+export type CopilotModelResolution =
+  | { readonly kind: "ok"; readonly options: CopilotSdkModelOptions }
+  | { readonly kind: "invalid"; readonly issue: string };
+
+/**
+ * Resolves a T3 model selection against the account's live inventory. The same
+ * descriptors the settings UI renders decide what is valid here, so a model or
+ * option the account cannot use is refused instead of quietly falling back to
+ * the runtime default.
+ */
+export function resolveCopilotModelOptions(input: {
+  readonly model: string;
+  readonly selections?: ReadonlyArray<ProviderOptionSelection> | undefined;
+  readonly inventory: ReadonlyArray<ModelInfo>;
+}): CopilotModelResolution {
+  const model = input.model.trim();
+  const available = buildCopilotModels(input.inventory);
+  const row = available.find((entry) => entry.slug === model);
+  if (!row) {
+    const slugs = available.map((entry) => entry.slug).join(", ");
+    return {
+      kind: "invalid",
+      issue: `Model '${model}' is not available on this GitHub Copilot account.${
+        slugs ? ` Available models: ${slugs}.` : ""
+      }`,
+    };
+  }
+  const descriptors = row.capabilities?.optionDescriptors ?? [];
+  let reasoningEffort: string | undefined;
+  let contextTier: string | undefined;
+  for (const selection of input.selections ?? []) {
+    const field = Object.hasOwn(OPTION_FIELDS, selection.id)
+      ? OPTION_FIELDS[selection.id as keyof typeof OPTION_FIELDS]
+      : undefined;
+    const descriptor = descriptors.find((entry) => entry.id === selection.id);
+    if (!field || !descriptor || descriptor.type !== "select") {
+      return {
+        kind: "invalid",
+        issue: `Model '${model}' does not support the '${selection.id}' option.`,
+      };
+    }
+    const value = typeof selection.value === "string" ? selection.value : "";
+    const choice = descriptor.options.find((option) => option.id === value);
+    if (!choice) {
+      return {
+        kind: "invalid",
+        issue: `'${String(selection.value)}' is not a supported ${
+          descriptor.label
+        } value for model '${model}'. Supported values: ${descriptor.options
+          .map((option) => option.id)
+          .join(", ")}.`,
+      };
+    }
+    if (field === "reasoningEffort") reasoningEffort = value;
+    else contextTier = value;
+  }
+  return {
+    kind: "ok",
+    options: {
+      model,
+      // Values are validated against the descriptors the snapshot built from
+      // this model's own capabilities, so they are members of the SDK unions.
+      ...(reasoningEffort
+        ? {
+            reasoningEffort: reasoningEffort as NonNullable<
+              CopilotSdkModelOptions["reasoningEffort"]
+            >,
+          }
+        : {}),
+      ...(contextTier
+        ? { contextTier: contextTier as NonNullable<CopilotSdkModelOptions["contextTier"]> }
+        : {}),
+    },
+  };
+}
+
+export function sameCopilotModelOptions(
+  left: CopilotSdkModelOptions | undefined,
+  right: CopilotSdkModelOptions | undefined,
+): boolean {
+  return (
+    left?.model === right?.model &&
+    left?.reasoningEffort === right?.reasoningEffort &&
+    left?.contextTier === right?.contextTier
+  );
 }
