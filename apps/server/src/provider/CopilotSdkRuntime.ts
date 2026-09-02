@@ -1,6 +1,10 @@
 import {
   CopilotClient,
   RuntimeConnection,
+  type MessageOptions,
+  type PermissionRequest,
+  type PermissionRequestResult,
+  type SessionEvent,
   type GetAuthStatusResponse,
   type ModelInfo,
 } from "@github/copilot-sdk";
@@ -106,6 +110,34 @@ async function stopClient(client: CopilotClient): Promise<void> {
 export interface CopilotSdkConnection {
   readonly authStatus: Effect.Effect<GetAuthStatusResponse, CopilotSdkRuntimeError>;
   readonly models: Effect.Effect<ReadonlyArray<ModelInfo>, CopilotSdkRuntimeError>;
+  readonly createSession: (
+    input: CopilotSdkSessionInput,
+  ) => Effect.Effect<CopilotSdkSession, CopilotSdkRuntimeError>;
+}
+
+export interface CopilotSdkSessionInput {
+  readonly workingDirectory: string;
+  readonly model?: string;
+  readonly onEvent: (event: SessionEvent) => void;
+  readonly onPermissionRequest: (request: unknown) => Promise<PermissionRequestResult>;
+}
+
+export interface CopilotSdkSession {
+  readonly sessionId: string;
+  readonly send: (input: MessageOptions) => Effect.Effect<string, CopilotSdkRuntimeError>;
+  readonly abort: Effect.Effect<void, CopilotSdkRuntimeError>;
+  readonly disconnect: Effect.Effect<void, CopilotSdkRuntimeError>;
+}
+
+function makeSession(
+  session: Awaited<ReturnType<CopilotClient["createSession"]>>,
+): CopilotSdkSession {
+  return {
+    sessionId: session.sessionId,
+    send: (input) => sdkEffect("session.send", () => session.send(input)),
+    abort: sdkEffect("session.abort", () => session.abort()),
+    disconnect: sdkEffect("session.disconnect", () => session.disconnect()),
+  };
 }
 
 export interface CopilotSdkRuntimeShape {
@@ -164,6 +196,16 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
     return {
       authStatus: sdkEffect("getAuthStatus", () => client.getAuthStatus()),
       models: sdkEffect("listModels", () => client.listModels()),
+      createSession: (input) =>
+        sdkEffect("createSession", () =>
+          client.createSession({
+            workingDirectory: input.workingDirectory,
+            ...(input.model ? { model: input.model } : {}),
+            streaming: true,
+            onEvent: input.onEvent,
+            onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
+          }),
+        ).pipe(Effect.map(makeSession)),
     };
   }),
 };
