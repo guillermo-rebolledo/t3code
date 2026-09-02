@@ -191,19 +191,19 @@ function wrapSession(
     send: (input) => sdkEffect("send", () => session.send(input)),
     abort: sdkEffect("abort", () => session.abort()).pipe(Effect.asVoid),
     setModel: (options) =>
-      sdkEffect("setModel", () =>
-        session.setModel(options.model, {
-          ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
-          ...(options.contextTier ? { contextTier: options.contextTier } : {}),
-        }),
-      ),
+      sdkEffect("setModel", () => session.setModel(options.model, modelSettings(options))),
     rewindPoints: sdkEffect("listRewindPoints", () => session.rpc.history.listRewindPoints()).pipe(
       Effect.map((result) => ({
-        points: result.points.map((point) => ({
-          eventId: point.eventId,
-          userMessage: point.userMessage,
-          timestamp: point.timestamp,
-        })),
+        // Autopilot continuations are turns the runtime injected on its own;
+        // they are not turns a user took, so counting them would shift every
+        // rollback boundary.
+        points: result.points
+          .filter((point) => !point.isAutopilotContinuation)
+          .map((point) => ({
+            eventId: point.eventId,
+            userMessage: point.userMessage,
+            timestamp: point.timestamp,
+          })),
         ...(result.unavailableReason ? { unavailableReason: result.unavailableReason } : {}),
       })),
     ),
@@ -215,29 +215,22 @@ function wrapSession(
   };
 }
 
-function modelConfig(options: CopilotSdkModelOptions | undefined) {
+/** The per-model settings both session configs and `setModel` accept. */
+function modelSettings(options: CopilotSdkModelOptions | undefined) {
   if (!options) return {};
   return {
-    model: options.model,
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.contextTier ? { contextTier: options.contextTier } : {}),
   };
 }
 
-function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig {
+/** Start and resume take the same shape; only the id the runtime looks up differs. */
+function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig & ResumeSessionConfig {
   return {
     workingDirectory: input.workingDirectory,
-    ...modelConfig(input.modelOptions),
-    streaming: true,
-    onEvent: input.onEvent,
-    onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
-  };
-}
-
-function resumeConfig(input: CopilotSdkSessionResumeInput): ResumeSessionConfig {
-  return {
-    workingDirectory: input.workingDirectory,
-    ...modelConfig(input.modelOptions),
+    ...(input.modelOptions
+      ? { model: input.modelOptions.model, ...modelSettings(input.modelOptions) }
+      : {}),
     streaming: true,
     onEvent: input.onEvent,
     onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
@@ -306,7 +299,7 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
         ),
       resumeSession: (input) =>
         sdkEffect("resumeSession", () =>
-          client.resumeSession(input.sessionId, resumeConfig(input)),
+          client.resumeSession(input.sessionId, sessionConfig(input)),
         ).pipe(Effect.map(wrapSession)),
     };
   }),

@@ -29,16 +29,11 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import type {
   CopilotSdkConnection,
-  CopilotSdkModelOptions,
   CopilotSdkRuntimeError,
   CopilotSdkSession,
 } from "../CopilotSdkRuntime.ts";
-import {
-  buildCopilotContinuation,
-  resolveCopilotContinuation,
-  resolveCopilotModelOptions,
-  sameCopilotModelOptions,
-} from "../CopilotContinuation.ts";
+import { buildCopilotContinuation, resolveCopilotContinuation } from "../CopilotContinuation.ts";
+import { resolveCopilotModelOptions } from "../CopilotSdkModels.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -74,8 +69,8 @@ interface CopilotTurnState {
 interface CopilotSessionContext {
   session: ProviderSession;
   readonly sdk: CopilotSdkSession;
-  /** Model and options currently applied to the live session, if any. */
-  modelOptions: CopilotSdkModelOptions | undefined;
+  /** Canonical form of the selection already applied, so an unchanged one is free. */
+  appliedModelKey: string | undefined;
   readonly turns: Array<CopilotTurnState>;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly deniedToolCallIds: Set<string>;
@@ -130,6 +125,21 @@ function runtimeErrorClass(errorType: string) {
 
 function errorDetail(error: unknown): string {
   return error instanceof Error && error.message.trim() ? error.message.trim() : String(error);
+}
+
+/**
+ * Canonical form of a model selection this adapter owns, used to skip the
+ * inventory read on the hot path when the selection has not moved.
+ */
+function modelSelectionKey(
+  selection: ModelSelection | undefined,
+  instanceId: ProviderInstanceId,
+): string | undefined {
+  if (!selection || selection.instanceId !== instanceId) return undefined;
+  const options = [...(selection.options ?? [])]
+    .map((option) => `${option.id}=${String(option.value)}`)
+    .sort();
+  return [selection.model, ...options].join("\n");
 }
 
 function mapSdkError(method: string, error: CopilotSdkRuntimeError) {
@@ -826,8 +836,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         issue: "cwd is required and must be non-empty.",
       });
     }
-    // A cursor that cannot be honored fails before anything is torn down, so a
-    // thread with unusable continuation state keeps the session it still has.
+    // Unusable continuation state is rejected before any session is torn down,
+    // so a thread whose cursor T3 cannot read keeps the session it still has.
+    // A cursor the runtime itself refuses is a different story: that failure
+    // surfaces below, after the previous session has already been released.
     const continuation = resolveCopilotContinuation(input.resumeCursor, instanceId);
     if (continuation.kind === "invalid") {
       return yield* new ProviderAdapterValidationError({
@@ -879,7 +891,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     sessions.set(threadId, {
       session,
       sdk,
-      modelOptions,
+      appliedModelKey: modelSelectionKey(input.modelSelection, instanceId),
       turns: [],
       pendingApprovals: new Map(),
       deniedToolCallIds: new Set(),
@@ -930,18 +942,23 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     }
 
     // The switch lands before the turn exists, so a rejected model or option
-    // fails the request outright instead of stranding a started turn.
-    const requestedModel = yield* resolveModelOptions("sendTurn", input.modelSelection);
-    if (requestedModel && !sameCopilotModelOptions(requestedModel, context.modelOptions)) {
-      yield* context.sdk
-        .setModel(requestedModel)
-        .pipe(Effect.mapError((error) => mapSdkError("setModel", error)));
-      context.modelOptions = requestedModel;
-      context.session = {
-        ...context.session,
-        model: requestedModel.model,
-        updatedAt: yield* nowIso,
-      };
+    // fails the request outright instead of stranding a started turn. An
+    // unchanged selection costs nothing: the inventory is only read when the
+    // selection actually moved.
+    const requestedKey = modelSelectionKey(input.modelSelection, instanceId);
+    if (requestedKey !== undefined && requestedKey !== context.appliedModelKey) {
+      const requestedModel = yield* resolveModelOptions("sendTurn", input.modelSelection);
+      if (requestedModel) {
+        yield* context.sdk
+          .setModel(requestedModel)
+          .pipe(Effect.mapError((error) => mapSdkError("setModel", error)));
+        context.session = {
+          ...context.session,
+          model: requestedModel.model,
+          updatedAt: yield* nowIso,
+        };
+      }
+      context.appliedModelKey = requestedKey;
     }
 
     const turnId = TurnId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
@@ -1127,8 +1144,15 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         });
       }
       const boundary = points[points.length - numTurns];
+      if (!boundary) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: `Cannot roll back ${numTurns} turn(s); this GitHub Copilot session has ${points.length}.`,
+        });
+      }
       const result = yield* context.sdk
-        .rewind(boundary!.eventId)
+        .rewind(boundary.eventId)
         .pipe(Effect.mapError((error) => mapSdkError("rewind", error)));
       // Only an outcome that actually truncated history may touch local state;
       // anything else leaves the session exactly as the caller found it.

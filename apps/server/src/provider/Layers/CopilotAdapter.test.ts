@@ -1485,4 +1485,39 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
       assert.lengthOf((yield* adapter.readThread(threadId)).turns, 2);
     }),
   );
+  it.effect("rolls a resumed session back using the history the provider still holds", () =>
+    Effect.gen(function* () {
+      const rewound: Array<string> = [];
+      const rewindPoints = Effect.succeed({
+        points: [rewindPoint("event-1", "First"), rewindPoint("event-2", "Second")],
+      });
+      const runtime = runtimeWith(() => Effect.succeed(fakeSession("resumed-rewind-session")), {
+        resumeSession: (input) =>
+          Effect.succeed(
+            fakeSession(input.sessionId, {
+              rewindPoints,
+              rewind: (eventId) =>
+                Effect.sync(() => {
+                  rewound.push(eventId);
+                  return { outcome: "success", eventsRemoved: 6 };
+                }),
+            }),
+          ),
+      });
+      const instanceId = ProviderInstanceId.make("copilot_work");
+      const adapter = yield* makeTestAdapter(runtime, { instanceId });
+      const threadId = ThreadId.make("resumed-rewind-thread");
+      yield* adapter.startSession({
+        ...startInput(threadId, instanceId),
+        resumeCursor: buildCopilotContinuation({ instanceId, sessionId: "copilot-session-3" }),
+      });
+
+      // The restarted adapter holds no turns of its own, so the rollback
+      // boundary can only come from the provider's own history.
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
+
+      assert.deepEqual(rewound, ["event-2"]);
+      assert.isEmpty(snapshot.turns);
+    }),
+  );
 });
