@@ -17,6 +17,7 @@ import {
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as PubSub from "effect/PubSub";
@@ -58,6 +59,8 @@ interface CopilotTurnState {
   readonly startedItems: Set<string>;
   readonly streamedItems: Set<string>;
   usage: unknown | undefined;
+  /** Set by the single settlement path so a turn emits `turn.completed` once. */
+  settled: boolean;
 }
 
 interface CopilotSessionContext {
@@ -67,11 +70,52 @@ interface CopilotSessionContext {
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly deniedToolCallIds: Set<string>;
   activeTurn: CopilotTurnState | undefined;
+  /**
+   * True while the runtime still owes the aborted `session.idle` for a turn T3
+   * already settled. It is swallowed whenever it lands, even if the runtime
+   * only gets to it after accepting the next turn's message.
+   */
+  awaitingAbortedIdle: boolean;
+  /** Resolved once the session is torn down, to release in-flight requests. */
+  readonly terminated: Deferred.Deferred<void>;
   stopped: boolean;
 }
 
 interface PendingApproval {
   readonly resolve: (decision: ProviderApprovalDecision) => void;
+}
+
+/**
+ * Queue payload for the single ordered consumer of native SDK events. Each item
+ * carries the turn that was live when the runtime emitted it.
+ */
+interface CopilotNativeItem {
+  readonly threadId: ThreadId;
+  readonly event: SessionEvent;
+  readonly turn: CopilotTurnState | undefined;
+}
+
+/** Copilot error categories the runtime recovers from on the same turn. */
+function isRecoverableSessionError(data: {
+  readonly errorType: string;
+  readonly eligibleForAutoSwitch?: boolean;
+}) {
+  // A rate limit eligible for an automatic model switch is retried on the same
+  // turn, and a context-limit response is retried after compaction.
+  return data.eligibleForAutoSwitch === true || data.errorType === "context_limit";
+}
+
+/** Maps a Copilot `session.error` category onto the canonical error class. */
+function runtimeErrorClass(errorType: string) {
+  switch (errorType) {
+    case "authentication":
+    case "authorization":
+      return "permission_error" as const;
+    case "query":
+      return "validation_error" as const;
+    default:
+      return "provider_error" as const;
+  }
 }
 
 function errorDetail(error: unknown): string {
@@ -96,10 +140,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const crypto = yield* Crypto.Crypto;
   const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
-  const nativeEvents = yield* Queue.unbounded<{
-    readonly threadId: ThreadId;
-    readonly event: SessionEvent;
-  }>();
+  const nativeEvents = yield* Queue.unbounded<CopilotNativeItem>();
   const sessions = new Map<ThreadId, CopilotSessionContext>();
   const nextId = crypto.randomUUIDv4.pipe(
     Effect.map((id) => EventId.make(id)),
@@ -249,6 +290,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
 
   const emitItemStarted = Effect.fn("CopilotAdapter.emitItemStarted")(function* (
     context: CopilotSessionContext,
+    turn: CopilotTurnState,
     key: string,
     itemId: RuntimeItemId,
     itemType: "assistant_message" | "reasoning" | "dynamic_tool_call",
@@ -256,8 +298,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     data?: unknown,
     title?: string,
   ) {
-    const turn = context.activeTurn;
-    if (!turn || turn.startedItems.has(key)) return;
+    if (turn.startedItems.has(key)) return;
     turn.startedItems.add(key);
     const base = yield* baseEvent(context.session.threadId, turn.id);
     yield* emit({
@@ -277,16 +318,15 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
 
   const emitTextDelta = Effect.fn("CopilotAdapter.emitTextDelta")(function* (
     context: CopilotSessionContext,
+    turn: CopilotTurnState,
     key: string,
     itemType: "assistant_message" | "reasoning",
     streamKind: "assistant_text" | "reasoning_text",
     delta: string,
     event: SessionEvent,
   ) {
-    const turn = context.activeTurn;
-    if (!turn) return;
     const itemId = RuntimeItemId.make(key);
-    yield* emitItemStarted(context, key, itemId, itemType, event);
+    yield* emitItemStarted(context, turn, key, itemId, itemType, event);
     turn.streamedItems.add(key);
     const base = yield* baseEvent(context.session.threadId, turn.id);
     yield* emit({
@@ -301,6 +341,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
 
   const emitTextCompleted = Effect.fn("CopilotAdapter.emitTextCompleted")(function* (
     context: CopilotSessionContext,
+    turn: CopilotTurnState,
     key: string,
     itemType: "assistant_message" | "reasoning",
     streamKind: "assistant_text" | "reasoning_text",
@@ -308,12 +349,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     data: unknown,
     event: SessionEvent,
   ) {
-    const turn = context.activeTurn;
-    if (!turn) return;
     const itemId = RuntimeItemId.make(key);
-    yield* emitItemStarted(context, key, itemId, itemType, event);
+    yield* emitItemStarted(context, turn, key, itemId, itemType, event);
     if (content && !turn.streamedItems.has(key)) {
-      yield* emitTextDelta(context, key, itemType, streamKind, content, event);
+      yield* emitTextDelta(context, turn, key, itemType, streamKind, content, event);
     }
     const base = yield* baseEvent(context.session.threadId, turn.id);
     yield* emit({
@@ -326,25 +365,151 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     });
   });
 
+  /** Releases every open approval so no request outlives the work that opened it. */
+  const releasePendingApprovals = (context: CopilotSessionContext) =>
+    Effect.sync(() => {
+      for (const pending of context.pendingApprovals.values()) pending.resolve("cancel");
+      context.pendingApprovals.clear();
+    });
+
+  /**
+   * The only place a turn settles. Every caller - idle, abort, error, send
+   * failure, interrupt, and session stop - funnels through here, so a turn
+   * emits exactly one `turn.completed` no matter how many settle attempts race.
+   */
+  const settleTurn = Effect.fn("CopilotAdapter.settleTurn")(function* (
+    context: CopilotSessionContext,
+    turn: CopilotTurnState,
+    payload: {
+      readonly state: "completed" | "failed" | "interrupted" | "cancelled";
+      readonly stopReason?: string;
+      readonly usage?: unknown;
+      readonly errorMessage?: string;
+    },
+    event?: SessionEvent,
+  ) {
+    if (turn.settled) return;
+    // Mutate before the first yield so a concurrent settle attempt observes the
+    // turn as already claimed.
+    turn.settled = true;
+    const wasActive = context.activeTurn === turn;
+    if (wasActive) context.activeTurn = undefined;
+    const updatedAt = yield* nowIso;
+    if (wasActive && !context.stopped) {
+      context.session = {
+        ...context.session,
+        status: "ready",
+        activeTurnId: undefined,
+        updatedAt,
+        ...(payload.errorMessage ? { lastError: payload.errorMessage } : {}),
+      };
+    }
+    const base = yield* baseEvent(context.session.threadId, turn.id);
+    yield* emit({
+      ...base,
+      type: "turn.completed",
+      payload,
+      ...(event
+        ? { raw: { source: "copilot.sdk.event", messageType: event.type, payload: event } }
+        : {}),
+    });
+  });
+
+  /**
+   * Terminal path for a session the Copilot runtime tore down on its own. It
+   * settles the visible turn, releases the SDK session, and reports one exit.
+   */
+  const shutdownSessionFromRuntime = Effect.fn("CopilotAdapter.shutdownSessionFromRuntime")(
+    function* (
+      context: CopilotSessionContext,
+      event: Extract<SessionEvent, { type: "session.shutdown" }>,
+    ) {
+      const failed = event.data.shutdownType === "error";
+      const reason =
+        event.data.errorReason?.trim() ||
+        (failed
+          ? "The GitHub Copilot session ended unexpectedly."
+          : "The GitHub Copilot session ended.");
+      yield* releasePendingApprovals(context);
+      const activeTurn = context.activeTurn;
+      if (activeTurn) {
+        yield* settleTurn(
+          context,
+          activeTurn,
+          failed
+            ? { state: "failed", errorMessage: reason }
+            : { state: "interrupted", stopReason: "session_shutdown" },
+          event,
+        );
+      }
+      const threadId = context.session.threadId;
+      context.stopped = true;
+      sessions.delete(threadId);
+      yield* Deferred.succeed(context.terminated, undefined);
+      yield* context.sdk.disconnect.pipe(Effect.ignore);
+      context.session = {
+        ...context.session,
+        status: "closed",
+        activeTurnId: undefined,
+        updatedAt: yield* nowIso,
+        ...(failed ? { lastError: reason } : {}),
+      };
+      const base = yield* baseEvent(threadId);
+      yield* emit({
+        ...base,
+        type: "session.exited",
+        payload: { reason, recoverable: false, exitKind: failed ? "error" : "graceful" },
+        raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+      });
+    },
+  );
+
   const handleEvent = Effect.fn("CopilotAdapter.handleEvent")(function* (
     threadId: ThreadId,
     event: SessionEvent,
+    observedTurn: CopilotTurnState | undefined,
   ) {
     yield* logNative(threadId, event).pipe(Effect.ignore);
     const context = sessions.get(threadId);
     if (!context || context.stopped) return;
-    const turn = context.activeTurn;
-    if (turn) turn.items.push(event);
+    // The aborted idle for a turn T3 already settled is dropped outright: it is
+    // the one late event that would otherwise complete a newer turn.
+    if (
+      event.type === "session.idle" &&
+      event.data.aborted === true &&
+      context.awaitingAbortedIdle
+    ) {
+      context.awaitingAbortedIdle = false;
+      return;
+    }
+    if (observedTurn) observedTurn.items.push(event);
+    // Turn-scoped work only applies to the turn that was live when the runtime
+    // emitted the event. Anything trailing an interrupted or settled turn is
+    // dropped instead of leaking into whatever turn is running now.
+    const turn =
+      observedTurn && observedTurn === context.activeTurn && !observedTurn.settled
+        ? observedTurn
+        : undefined;
 
     switch (event.type) {
       case "assistant.message_start": {
+        if (!turn) break;
         const itemId = RuntimeItemId.make(event.data.messageId);
-        yield* emitItemStarted(context, event.data.messageId, itemId, "assistant_message", event);
+        yield* emitItemStarted(
+          context,
+          turn,
+          event.data.messageId,
+          itemId,
+          "assistant_message",
+          event,
+        );
         break;
       }
       case "assistant.message_delta": {
+        if (!turn) break;
         yield* emitTextDelta(
           context,
+          turn,
           event.data.messageId,
           "assistant_message",
           "assistant_text",
@@ -354,8 +519,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         break;
       }
       case "assistant.message": {
+        if (!turn) break;
         yield* emitTextCompleted(
           context,
+          turn,
           event.data.messageId,
           "assistant_message",
           "assistant_text",
@@ -366,8 +533,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         break;
       }
       case "assistant.reasoning_delta": {
+        if (!turn) break;
         yield* emitTextDelta(
           context,
+          turn,
           event.data.reasoningId,
           "reasoning",
           "reasoning_text",
@@ -377,8 +546,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         break;
       }
       case "assistant.reasoning": {
+        if (!turn) break;
         yield* emitTextCompleted(
           context,
+          turn,
           event.data.reasoningId,
           "reasoning",
           "reasoning_text",
@@ -394,6 +565,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         if (context.deniedToolCallIds.has(key)) break;
         yield* emitItemStarted(
           context,
+          turn,
           key,
           RuntimeItemId.make(key),
           "dynamic_tool_call",
@@ -491,26 +663,68 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       }
       case "session.idle": {
         if (!turn) break;
-        context.activeTurn = undefined;
-        context.session = {
-          ...context.session,
-          status: "ready",
-          activeTurnId: undefined,
-          updatedAt: yield* nowIso,
+        yield* settleTurn(
+          context,
+          turn,
+          event.data.aborted === true
+            ? { state: "interrupted", stopReason: "user_interrupt" }
+            : { state: "completed", ...(turn.usage ? { usage: turn.usage } : {}) },
+          event,
+        );
+        break;
+      }
+      case "abort": {
+        // An abort T3 did not initiate; `interruptTurn` claims its own idle.
+        context.awaitingAbortedIdle = true;
+        if (!turn) break;
+        yield* settleTurn(
+          context,
+          turn,
+          { state: "interrupted", stopReason: event.data.reason },
+          event,
+        );
+        break;
+      }
+      case "session.error": {
+        const message = event.data.message.trim() || "GitHub Copilot reported an error.";
+        const recoverable = isRecoverableSessionError(event.data);
+        const base = yield* baseEvent(threadId, turn?.id);
+        const raw = {
+          source: "copilot.sdk.event" as const,
+          messageType: event.type,
+          payload: event,
         };
-        const base = yield* baseEvent(threadId, turn.id);
-        yield* emit({
-          ...base,
-          type: "turn.completed",
-          payload: { state: "completed", ...(turn.usage ? { usage: turn.usage } : {}) },
-          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
-        });
+        if (recoverable) {
+          yield* emit({
+            ...base,
+            type: "runtime.warning",
+            payload: { message, detail: event.data },
+            raw,
+          });
+        } else {
+          yield* emit({
+            ...base,
+            type: "runtime.error",
+            payload: {
+              message,
+              class: runtimeErrorClass(event.data.errorType),
+              detail: event.data,
+            },
+            raw,
+          });
+        }
+        if (!turn || recoverable) break;
+        yield* settleTurn(context, turn, { state: "failed", errorMessage: message }, event);
+        break;
+      }
+      case "session.shutdown": {
+        yield* shutdownSessionFromRuntime(context, event);
         break;
       }
     }
   });
-  yield* Stream.runForEach(Stream.fromQueue(nativeEvents), ({ threadId, event }) =>
-    handleEvent(threadId, event).pipe(Effect.catchCause(Effect.logError)),
+  yield* Stream.runForEach(Stream.fromQueue(nativeEvents), ({ threadId, event, turn }) =>
+    handleEvent(threadId, event, turn).pipe(Effect.catchCause(Effect.logError)),
   ).pipe(Effect.forkScoped);
 
   const stopSessionInternal = Effect.fn("CopilotAdapter.stopSessionInternal")(function* (
@@ -518,20 +732,19 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     emitExit: boolean,
   ) {
     if (context.stopped) return;
-    for (const pending of context.pendingApprovals.values()) pending.resolve("cancel");
-    context.pendingApprovals.clear();
+    yield* releasePendingApprovals(context);
     const activeTurn = context.activeTurn;
-    context.activeTurn = undefined;
     context.stopped = true;
     sessions.delete(context.session.threadId);
     if (activeTurn) {
-      const turnBase = yield* baseEvent(context.session.threadId, activeTurn.id);
-      yield* emit({
-        ...turnBase,
-        type: "turn.completed",
-        payload: { state: "cancelled", stopReason: "session_stopped" },
+      yield* settleTurn(context, activeTurn, {
+        state: "cancelled",
+        stopReason: "session_stopped",
       });
     }
+    // Released after the turn settles so a send waiting on this session sees
+    // the settled turn and does not report a second failure for it.
+    yield* Deferred.succeed(context.terminated, undefined);
     yield* context.sdk.disconnect.pipe(
       Effect.mapError((error) => mapSdkError("disconnect", error)),
     );
@@ -580,7 +793,11 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
 
     const threadId = input.threadId;
     const onEvent = (event: SessionEvent) => {
-      Queue.offerUnsafe(nativeEvents, { threadId, event });
+      Queue.offerUnsafe(nativeEvents, {
+        threadId,
+        event,
+        turn: sessions.get(threadId)?.activeTurn,
+      });
     };
     const sdkInput = {
       workingDirectory: input.cwd.trim(),
@@ -615,6 +832,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       pendingApprovals: new Map(),
       deniedToolCallIds: new Set(),
       activeTurn: undefined,
+      awaitingAbortedIdle: false,
+      terminated: yield* Deferred.make<void>(),
       stopped: false,
     });
     const sessionBase = yield* baseEvent(threadId);
@@ -665,6 +884,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       startedItems: new Set(),
       streamedItems: new Set(),
       usage: undefined,
+      settled: false,
     };
     context.turns.push(turn);
     context.activeTurn = turn;
@@ -686,25 +906,70 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         prompt: input.input?.trim() ?? "",
         ...(attachments.length > 0 ? { attachments } : {}),
       })
-      .pipe(Effect.result);
+      .pipe(
+        // A send left hanging by a dead runtime must not pin the request
+        // forever; session teardown releases it.
+        Effect.raceFirst(
+          Deferred.await(context.terminated).pipe(
+            Effect.andThen(
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "send",
+                detail: "The GitHub Copilot session ended before the message was accepted.",
+              }),
+            ),
+          ),
+        ),
+        Effect.result,
+      );
     if (sendResult._tag === "Failure") {
-      context.activeTurn = undefined;
-      context.session = {
-        ...context.session,
-        status: "ready",
-        activeTurnId: undefined,
-        updatedAt: yield* nowIso,
-        lastError: sendResult.failure.detail,
-      };
-      const failedBase = yield* baseEvent(input.threadId, turnId);
-      yield* emit({
-        ...failedBase,
-        type: "turn.completed",
-        payload: { state: "failed", errorMessage: sendResult.failure.detail },
+      if (turn.settled) {
+        // The turn already settled - an interrupt, a runtime error, or a
+        // session stop - and this rejection is a consequence of that, not a new
+        // failure to report on top of it.
+        return { threadId: input.threadId, turnId };
+      }
+      yield* settleTurn(context, turn, {
+        state: "failed",
+        errorMessage: sendResult.failure.detail,
       });
-      return yield* mapSdkError("send", sendResult.failure);
+      return yield* sendResult.failure._tag === "ProviderAdapterRequestError"
+        ? sendResult.failure
+        : mapSdkError("send", sendResult.failure);
     }
     return { threadId: input.threadId, turnId };
+  });
+
+  /**
+   * Interrupting settles the visible turn locally before the SDK abort is
+   * awaited, so events the runtime emits while it winds down are already
+   * orphaned and cannot attach to the next turn. A failing abort still
+   * propagates: the turn is settled for the user either way, but a runtime that
+   * refused to stop is worth surfacing rather than swallowing.
+   */
+  const interruptTurn = Effect.fn("CopilotAdapter.interruptTurn")(function* (
+    threadId: ThreadId,
+    turnId?: TurnId,
+  ) {
+    const context = sessions.get(threadId);
+    if (!context || context.stopped) return;
+    const turn = context.activeTurn;
+    if (!turn || turn.settled) return;
+    if (turnId !== undefined && turn.id !== turnId) return;
+    context.awaitingAbortedIdle = true;
+    // An approval the user will never answer must not outlive the turn that
+    // asked for it, or the SDK keeps waiting on a request nobody can see.
+    yield* releasePendingApprovals(context);
+    yield* settleTurn(context, turn, { state: "interrupted", stopReason: "user_interrupt" });
+    yield* context.sdk.abort.pipe(
+      Effect.catch((error) =>
+        // A runtime that would not abort must not keep working with no way to
+        // stop it, so fall back to the hard session boundary.
+        Effect.logWarning(`GitHub Copilot abort failed: ${error.detail}`).pipe(
+          Effect.andThen(stopSessionInternal(context, true)),
+        ),
+      ),
+    );
   });
 
   const unsupported = (method: string) =>
@@ -733,7 +998,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     capabilities: { sessionModelSwitch: "unsupported" },
     startSession,
     sendTurn,
-    interruptTurn: () => unsupported("interruptTurn"),
+    interruptTurn,
     respondToRequest: (threadId, requestId, decision) =>
       Effect.gen(function* () {
         const context = yield* requireSession(threadId);

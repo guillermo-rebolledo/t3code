@@ -126,6 +126,8 @@ export interface CopilotSdkSessionStartInput {
 export interface CopilotSdkSession {
   readonly sessionId: string;
   readonly send: (input: MessageOptions) => Effect.Effect<string, CopilotSdkRuntimeError>;
+  /** Aborts the message the session is currently processing. The session stays usable. */
+  readonly abort: Effect.Effect<void, CopilotSdkRuntimeError>;
   readonly disconnect: Effect.Effect<void, CopilotSdkRuntimeError>;
 }
 
@@ -135,6 +137,7 @@ function wrapSession(
   return {
     sessionId: session.sessionId,
     send: (input) => sdkEffect("send", () => session.send(input)),
+    abort: sdkEffect("abort", () => session.abort()).pipe(Effect.asVoid),
     disconnect: sdkEffect("disconnect", () => session.disconnect()),
   };
 }

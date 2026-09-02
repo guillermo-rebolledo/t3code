@@ -12,11 +12,11 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Ref from "effect/Ref";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -39,15 +39,45 @@ function fakeSession(
   sessionId: string,
   options: {
     readonly send?: CopilotSdkSession["send"];
+    readonly abort?: CopilotSdkSession["abort"];
+    readonly onAbort?: () => void;
     readonly onDisconnect?: () => void;
   } = {},
 ): CopilotSdkSession {
   return {
     sessionId,
     send: options.send ?? (() => Effect.succeed("message-1")),
+    abort: options.abort ?? Effect.sync(() => options.onAbort?.()),
     disconnect: Effect.sync(() => options.onDisconnect?.()),
   };
 }
+
+/**
+ * Drains the adapter's runtime events into a queue so a test can advance to a
+ * specific event and then assert on everything observed up to that point,
+ * without sleeping or polling.
+ */
+const observeEvents = Effect.fn("observeEvents")(function* (adapter: {
+  readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+}) {
+  const queue = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) =>
+    Queue.offer(queue, runtimeEvent),
+  ).pipe(Effect.forkChild);
+  yield* Effect.yieldNow;
+  const seen: Array<ProviderRuntimeEvent> = [];
+  return {
+    seen,
+    until: (predicate: (runtimeEvent: ProviderRuntimeEvent) => boolean) =>
+      Effect.gen(function* () {
+        for (;;) {
+          const runtimeEvent = yield* Queue.take(queue);
+          seen.push(runtimeEvent);
+          if (predicate(runtimeEvent)) return runtimeEvent;
+        }
+      }),
+  };
+});
 
 let eventSequence = 0;
 let sessionSequence = 0;
@@ -643,6 +673,424 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
       const sentinel = yield* Queue.take(completed);
       assert.equal(sentinel.itemId, "tool-sentinel");
       assert.equal(sentinel.payload.status, "completed");
+    }),
+  );
+
+  it.effect("interrupts a running turn exactly once and stays idempotent", () =>
+    Effect.gen(function* () {
+      let aborts = 0;
+      let emitNative: ((value: SessionEvent) => void) | undefined;
+      const runtime = runtimeWith((input) => {
+        emitNative = input.onEvent;
+        return Effect.succeed(
+          fakeSession("interrupt-session", {
+            onAbort: () => (aborts += 1),
+            send: () =>
+              Effect.sync(() => {
+                input.onEvent(
+                  event({
+                    type: "assistant.message_delta",
+                    ephemeral: true,
+                    data: { messageId: "message-1", deltaContent: "Working" },
+                  }),
+                );
+                return "message-1";
+              }),
+          }),
+        );
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("interrupt-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const turn = yield* adapter.sendTurn({ threadId, input: "Work" });
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "content.delta");
+
+      yield* adapter.interruptTurn(threadId);
+      yield* adapter.interruptTurn(threadId);
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      const settled = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+      // The runtime's own abort acknowledgement must not settle the turn twice.
+      emitNative?.(event({ type: "abort", data: { reason: "user_initiated" } }));
+      emitNative?.(event({ type: "session.idle", ephemeral: true, data: { aborted: true } }));
+      emitNative?.(
+        event({
+          type: "session.usage_info",
+          ephemeral: true,
+          data: { currentTokens: 12, tokenLimit: 100 },
+        }),
+      );
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "thread.token-usage.updated");
+
+      assert.equal(aborts, 1);
+      assert.equal(settled.turnId, turn.turnId);
+      assert.deepEqual(settled.payload, { state: "interrupted", stopReason: "user_interrupt" });
+      assert.lengthOf(
+        observer.seen.filter((runtimeEvent) => runtimeEvent.type === "turn.completed"),
+        1,
+      );
+      const session = (yield* adapter.listSessions())[0];
+      assert.equal(session?.status, "ready");
+      assert.isUndefined(session?.activeTurnId);
+    }),
+  );
+
+  it.effect("keeps late events from an interrupted turn out of the next turn", () =>
+    Effect.gen(function* () {
+      let emitNative: ((value: SessionEvent) => void) | undefined;
+      const runtime = runtimeWith((input) => {
+        emitNative = input.onEvent;
+        return Effect.succeed(
+          fakeSession("late-session", {
+            send: () =>
+              Effect.sync(() => {
+                input.onEvent(
+                  event({
+                    type: "assistant.message_delta",
+                    ephemeral: true,
+                    data: { messageId: "message-1", deltaContent: "Working" },
+                  }),
+                );
+                return "message-1";
+              }),
+          }),
+        );
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("late-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const first = yield* adapter.sendTurn({ threadId, input: "Work" });
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "content.delta");
+      yield* adapter.interruptTurn(threadId);
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+
+      // Everything the runtime still had in flight for the interrupted turn.
+      emitNative?.(
+        event({ type: "assistant.message", data: { messageId: "message-1", content: "Working" } }),
+      );
+      emitNative?.(
+        event({ type: "tool.execution_complete", data: { toolCallId: "tool-1", success: true } }),
+      );
+      emitNative?.(
+        event({
+          type: "assistant.usage",
+          ephemeral: true,
+          data: { model: "gpt-5", inputTokens: 9, outputTokens: 3 },
+        }),
+      );
+
+      const second = yield* adapter.sendTurn({ threadId, input: "Try again" });
+      // The interrupted turn's aborted idle only reaches us once the next turn
+      // is already running, so the turn tag alone cannot reject it.
+      emitNative?.(event({ type: "session.idle", ephemeral: true, data: { aborted: true } }));
+      emitNative?.(event({ type: "session.idle", ephemeral: true, data: {} }));
+      const settled = yield* observer.until(
+        (runtimeEvent) =>
+          runtimeEvent.type === "turn.completed" && runtimeEvent.turnId === second.turnId,
+      );
+
+      assert.notEqual(second.turnId, first.turnId);
+      assert.deepEqual(settled.payload, { state: "completed" });
+      const afterInterrupt = observer.seen.slice(
+        observer.seen.findIndex((runtimeEvent) => runtimeEvent.type === "turn.completed") + 1,
+      );
+      // Only the second turn's own events follow: no item.completed from the
+      // interrupted turn's trailing message and no usage it leaked.
+      assert.deepEqual(
+        afterInterrupt.map((runtimeEvent) => runtimeEvent.type),
+        ["turn.started", "item.started", "content.delta", "turn.completed"],
+      );
+    }),
+  );
+
+  it.effect("settles once when a send fails after the turn was interrupted", () =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("pending-send-session", {
+            send: () =>
+              Deferred.await(release).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new SdkError({
+                      operation: "send",
+                      kind: "failure",
+                      detail: "connection closed",
+                    }),
+                  ),
+                ),
+              ),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("pending-send-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const sending = yield* Effect.forkChild(
+        adapter.sendTurn({ threadId, input: "Work" }).pipe(Effect.result),
+      );
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "turn.started");
+
+      yield* adapter.interruptTurn(threadId);
+      const settled = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+      yield* Deferred.succeed(release, undefined);
+      const sent = yield* Fiber.join(sending);
+
+      assert.deepEqual(settled.payload, { state: "interrupted", stopReason: "user_interrupt" });
+      // The rejection is a consequence of the interrupt, so it is not reported
+      // as a second, separate failure on top of the settled turn.
+      assert.equal(sent._tag, "Success");
+      assert.lengthOf(
+        observer.seen.filter((runtimeEvent) => runtimeEvent.type === "turn.completed"),
+        1,
+      );
+      // The session survives a failed send, so the next turn can start.
+      assert.isTrue(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("reports a runtime error and fails the visible turn", () =>
+    Effect.gen(function* () {
+      let emitNative: ((value: SessionEvent) => void) | undefined;
+      const runtime = runtimeWith((input) => {
+        emitNative = input.onEvent;
+        return Effect.succeed(fakeSession("error-session"));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("error-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const turn = yield* adapter.sendTurn({ threadId, input: "Work" });
+
+      emitNative?.(
+        event({
+          type: "session.error",
+          data: { errorType: "authentication", message: "Token expired" },
+        }),
+      );
+      const settled = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+
+      const runtimeError = observer.seen.find(
+        (runtimeEvent) => runtimeEvent.type === "runtime.error",
+      );
+      assert.isDefined(runtimeError);
+      assert.equal(
+        runtimeError?.type === "runtime.error" ? runtimeError.payload.class : undefined,
+        "permission_error",
+      );
+      assert.equal(settled.turnId, turn.turnId);
+      assert.deepEqual(settled.payload, { state: "failed", errorMessage: "Token expired" });
+      assert.isTrue(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("settles the turn and closes the session when the runtime shuts down", () =>
+    Effect.gen(function* () {
+      let disconnects = 0;
+      let emitNative: ((value: SessionEvent) => void) | undefined;
+      const runtime = runtimeWith((input) => {
+        emitNative = input.onEvent;
+        return Effect.succeed(
+          fakeSession("shutdown-session", { onDisconnect: () => (disconnects += 1) }),
+        );
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("shutdown-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const turn = yield* adapter.sendTurn({ threadId, input: "Work" });
+
+      emitNative?.(
+        event({
+          type: "session.shutdown",
+          data: {
+            shutdownType: "error",
+            errorReason: "Copilot runtime exited",
+            codeChanges: { filesModified: [], linesAdded: 0, linesRemoved: 0 },
+            modelMetrics: {},
+            sessionStartTime: 0,
+            totalApiDurationMs: 0,
+          },
+        }),
+      );
+      const settled = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+      const exited = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "session.exited",
+      );
+
+      assert.equal(settled.turnId, turn.turnId);
+      assert.deepEqual(settled.payload, {
+        state: "failed",
+        errorMessage: "Copilot runtime exited",
+      });
+      assert.deepEqual(exited.payload, {
+        reason: "Copilot runtime exited",
+        recoverable: false,
+        exitKind: "error",
+      });
+      assert.equal(disconnects, 1);
+      assert.isFalse(yield* adapter.hasSession(threadId));
+      // A dead session no longer accepts work.
+      const rejected = yield* adapter.sendTurn({ threadId, input: "Again" }).pipe(Effect.result);
+      assert.equal(rejected._tag, "Failure");
+    }),
+  );
+
+  it.effect("treats a recoverable Copilot error as a warning and lets the turn finish", () =>
+    Effect.gen(function* () {
+      let emitNative: ((value: SessionEvent) => void) | undefined;
+      const runtime = runtimeWith((input) => {
+        emitNative = input.onEvent;
+        return Effect.succeed(fakeSession("recoverable-session"));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("recoverable-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const turn = yield* adapter.sendTurn({ threadId, input: "Work" });
+
+      // The runtime compacts and retries this one, so it must not end the turn.
+      emitNative?.(
+        event({
+          type: "session.error",
+          data: { errorType: "context_limit", message: "Context limit reached" },
+        }),
+      );
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "runtime.warning");
+      emitNative?.(event({ type: "session.idle", ephemeral: true, data: {} }));
+      const settled = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+
+      assert.equal(settled.turnId, turn.turnId);
+      assert.deepEqual(settled.payload, { state: "completed" });
+      assert.isUndefined(
+        observer.seen.find((runtimeEvent) => runtimeEvent.type === "runtime.error"),
+      );
+    }),
+  );
+
+  it.effect("stops the session when the runtime refuses to abort", () =>
+    Effect.gen(function* () {
+      let disconnects = 0;
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("stubborn-session", {
+            abort: Effect.fail(
+              new SdkError({ operation: "abort", kind: "failure", detail: "abort rejected" }),
+            ),
+            onDisconnect: () => (disconnects += 1),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("stubborn-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      yield* adapter.sendTurn({ threadId, input: "Work" });
+
+      yield* adapter.interruptTurn(threadId);
+      const exited = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "session.exited",
+      );
+
+      assert.deepEqual(
+        observer.seen
+          .filter((runtimeEvent) => runtimeEvent.type === "turn.completed")
+          .map((runtimeEvent) => runtimeEvent.payload),
+        [{ state: "interrupted", stopReason: "user_interrupt" }],
+      );
+      assert.deepEqual(exited.payload, {
+        reason: "Session stopped.",
+        recoverable: false,
+        exitKind: "graceful",
+      });
+      assert.equal(disconnects, 1);
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("releases a send that the runtime never answers when the session stops", () =>
+    Effect.gen(function* () {
+      const never = yield* Deferred.make<string>();
+      const runtime = runtimeWith(() =>
+        Effect.succeed(fakeSession("hanging-session", { send: () => Deferred.await(never) })),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("hanging-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const sending = yield* Effect.forkChild(
+        adapter.sendTurn({ threadId, input: "Work" }).pipe(Effect.result),
+      );
+      yield* observer.until((runtimeEvent) => runtimeEvent.type === "turn.started");
+
+      yield* adapter.stopSession(threadId);
+      // Without the release this join never returns.
+      const sent = yield* Fiber.join(sending);
+      const settled = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+
+      assert.equal(sent._tag, "Success");
+      assert.deepEqual(settled.payload, { state: "cancelled", stopReason: "session_stopped" });
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("releases a pending approval when the turn is interrupted", () =>
+    Effect.gen(function* () {
+      let sdkInput: CopilotSdkSessionStartInput | undefined;
+      const runtime = runtimeWith((input) => {
+        sdkInput = input;
+        return Effect.succeed(fakeSession("approval-interrupt-session"));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("approval-interrupt-thread");
+      const observer = yield* observeEvents(adapter);
+      yield* adapter.startSession({
+        ...startInput(threadId, ProviderInstanceId.make("copilot")),
+        runtimeMode: "approval-required",
+      });
+      yield* adapter.sendTurn({ threadId, input: "Work" });
+      const permission = yield* Effect.forkChild(
+        Effect.promise(() =>
+          sdkInput!.onPermissionRequest({
+            kind: "shell",
+            fullCommandText: "pnpm test",
+            intention: "Run tests",
+            commands: [{ identifier: "pnpm", readOnly: true }],
+            canOfferSessionApproval: true,
+          }),
+        ),
+      );
+      const opened = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "request.opened",
+      );
+
+      yield* adapter.interruptTurn(threadId);
+      const resolved = yield* observer.until(
+        (runtimeEvent) => runtimeEvent.type === "request.resolved",
+      );
+      // Without the release the SDK waits on this promise forever.
+      const outcome = yield* Fiber.join(permission);
+
+      assert.equal(resolved.requestId, opened.requestId);
+      assert.deepEqual(outcome, {
+        kind: "reject",
+        feedback: "The user cancelled this request.",
+      });
     }),
   );
 
