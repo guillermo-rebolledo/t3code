@@ -195,6 +195,15 @@ describe("resolveProviderSkillSourceKind", () => {
     ).toBe("app");
   });
 
+  it("marks a skill the provider itself scoped to an app install as one", () => {
+    expect(
+      resolveProviderSkillSourceKind({
+        path: "/Users/julius/.copilot/plugins/deploy/SKILL.md",
+        scope: "app",
+      }),
+    ).toBe("app");
+  });
+
   it("maps standard scopes to source kinds", () => {
     expect(
       resolveProviderSkillSourceKind({

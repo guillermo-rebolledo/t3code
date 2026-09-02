@@ -18,6 +18,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -46,6 +47,8 @@ function fakeSession(
     readonly onAbort?: () => void;
     readonly onDisconnect?: () => void;
     readonly setModel?: CopilotSdkSession["setModel"];
+    readonly listCommands?: CopilotSdkSession["listCommands"];
+    readonly invokeCommand?: CopilotSdkSession["invokeCommand"];
     readonly onSetModel?: (modelOptions: CopilotSdkModelOptions) => void;
     readonly rewindPoints?: CopilotSdkSession["rewindPoints"];
     readonly rewind?: CopilotSdkSession["rewind"];
@@ -57,6 +60,17 @@ function fakeSession(
     abort: options.abort ?? Effect.sync(() => options.onAbort?.()),
     setModel:
       options.setModel ?? ((modelOptions) => Effect.sync(() => options.onSetModel?.(modelOptions))),
+    listCommands: options.listCommands ?? Effect.succeed([]),
+    invokeCommand:
+      options.invokeCommand ??
+      (() =>
+        Effect.fail(
+          new SdkError({
+            operation: "invokeCommand",
+            kind: "failure",
+            detail: "command invocation was not expected in this test",
+          }),
+        )),
     rewindPoints: options.rewindPoints ?? Effect.succeed({ points: [] }),
     rewind: options.rewind ?? (() => Effect.succeed({ outcome: "success", eventsRemoved: 0 })),
     disconnect: Effect.sync(() => options.onDisconnect?.()),
@@ -109,12 +123,16 @@ function runtimeWith(
     readonly onRelease?: () => void;
     readonly resumeSession?: CopilotSdkConnection["resumeSession"];
     readonly models?: CopilotSdkConnection["models"];
+    readonly workspaceCommands?: CopilotSdkConnection["workspaceCommands"];
+    readonly workspaceSkills?: CopilotSdkConnection["workspaceSkills"];
   } = {},
 ): CopilotSdkRuntimeShape {
   const connection: CopilotSdkConnection = {
     authStatus: Effect.succeed({ isAuthenticated: true }),
     models: options.models ?? Effect.succeed([]),
     createSession,
+    workspaceCommands: options.workspaceCommands ?? (() => Effect.succeed([])),
+    workspaceSkills: options.workspaceSkills ?? (() => Effect.succeed([])),
     resumeSession:
       options.resumeSession ??
       (() =>
@@ -1518,6 +1536,275 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
 
       assert.deepEqual(rewound, ["event-2"]);
       assert.isEmpty(snapshot.turns);
+    }),
+  );
+  it.effect("routes an advertised command through the command RPC and shows its output", () =>
+    Effect.gen(function* () {
+      const sends: Array<string> = [];
+      const invocations: Array<{ name: string; input?: string }> = [];
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("command-session", {
+            listCommands: Effect.succeed([{ name: "usage", description: "Show usage" }]),
+            invokeCommand: (invocation) => {
+              invocations.push(invocation);
+              return Effect.succeed({ kind: "text", text: "42 premium requests left" });
+            },
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push(message.prompt);
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("command-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      yield* adapter.sendTurn({ threadId, input: "/usage this month" });
+      yield* observed.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+
+      assert.deepEqual(invocations, [{ name: "usage", input: "this month" }]);
+      assert.isEmpty(sends);
+      const delta = observed.seen.find((runtimeEvent) => runtimeEvent.type === "content.delta");
+      assert.deepInclude(delta?.payload, {
+        streamKind: "assistant_text",
+        delta: "42 premium requests left",
+      });
+      const completed = observed.seen.find(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+      assert.deepEqual(completed?.payload, { state: "completed" });
+    }),
+  );
+
+  it.effect("sends a command's agent prompt as the turn's message", () =>
+    Effect.gen(function* () {
+      const sends: Array<{ prompt: string; agentMode?: string }> = [];
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("command-prompt-session", {
+            listCommands: Effect.succeed([{ name: "review" }]),
+            invokeCommand: () =>
+              Effect.succeed({
+                kind: "agent-prompt",
+                prompt: "Review the staged diff",
+                mode: "plan",
+              }),
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push({
+                  prompt: message.prompt,
+                  ...(message.agentMode ? { agentMode: message.agentMode } : {}),
+                });
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("command-prompt-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      yield* adapter.sendTurn({ threadId, input: "/review" });
+      yield* observed.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+
+      // The mode the command asked for is not applied: the thread's runtime
+      // mode belongs to T3 and must not move where the user cannot see it.
+      assert.deepEqual(sends, [{ prompt: "Review the staged diff" }]);
+    }),
+  );
+
+  it.effect("sends ordinary prompts, unknown slash text, and T3-owned names normally", () =>
+    Effect.gen(function* () {
+      const sends: Array<string> = [];
+      let invoked = 0;
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("prompt-session", {
+            // `model` is owned by T3's model picker, so Copilot never
+            // advertises it and `/model ...` stays ordinary text.
+            listCommands: Effect.succeed([{ name: "usage" }, { name: "model" }]),
+            invokeCommand: () =>
+              Effect.sync(() => {
+                invoked += 1;
+                return { kind: "text", text: "should not run" };
+              }),
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push(message.prompt);
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("prompt-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      for (const prompt of ["/deploy staging", "please /usage now", "/model gpt-5.4"]) {
+        yield* adapter.sendTurn({ threadId, input: prompt });
+        yield* observed.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+      }
+
+      assert.deepEqual(sends, ["/deploy staging", "please /usage now", "/model gpt-5.4"]);
+      assert.equal(invoked, 0);
+    }),
+  );
+
+  it.effect("invokes a skill picked as a $ mention and keeps one in prose legible", () =>
+    Effect.gen(function* () {
+      const sends: Array<string> = [];
+      const invocations: Array<{ name: string; input?: string }> = [];
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("skill-mention-session", {
+            // Copilot advertises its user-invocable skills as commands, so
+            // `deploy` reaches the adapter through the same catalog.
+            listCommands: Effect.succeed([{ name: "deploy" }]),
+            invokeCommand: (invocation) => {
+              invocations.push(invocation);
+              return Effect.succeed({ kind: "text", text: "Deployed" });
+            },
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push(message.prompt);
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("skill-mention-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      yield* adapter.sendTurn({ threadId, input: "$deploy staging" });
+      yield* observed.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+      yield* adapter.sendTurn({ threadId, input: "please $deploy staging, then $HOME" });
+      yield* observed.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed" && sends.length > 0,
+      );
+
+      assert.deepEqual(invocations, [{ name: "deploy", input: "staging" }]);
+      // The mention Copilot advertised becomes command text it can act on; an
+      // unadvertised `$HOME` stays exactly what the user wrote.
+      assert.deepEqual(sends, ["please /deploy staging, then $HOME"]);
+    }),
+  );
+
+  it.effect("fails the turn once when the command RPC rejects", () =>
+    Effect.gen(function* () {
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("command-failure-session", {
+            listCommands: Effect.succeed([{ name: "usage" }]),
+            invokeCommand: () =>
+              Effect.fail(
+                new SdkError({
+                  operation: "invokeCommand",
+                  kind: "failure",
+                  detail: "command rejected",
+                }),
+              ),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("command-failure-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      const failed = yield* adapter.sendTurn({ threadId, input: "/usage" }).pipe(Effect.result);
+      const completed = yield* observed.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+
+      assert.equal(failed._tag, "Failure");
+      assert.deepEqual(completed.payload, {
+        state: "failed",
+        errorMessage: "command rejected",
+      });
+    }),
+  );
+
+  it.effect("starts the session when the runtime never answers the command list", () =>
+    Effect.gen(function* () {
+      const sends: Array<string> = [];
+      const listing = yield* Deferred.make<void>();
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("hanging-commands-session", {
+            listCommands: Deferred.succeed(listing, undefined).pipe(Effect.andThen(Effect.never)),
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push(message.prompt);
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("hanging-commands-thread");
+      const observed = yield* observeEvents(adapter);
+
+      const started = yield* adapter
+        .startSession(startInput(threadId, ProviderInstanceId.make("copilot")))
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(listing);
+      yield* TestClock.adjust("10 seconds");
+      const session = yield* Fiber.join(started);
+
+      yield* adapter.sendTurn({ threadId, input: "/usage" });
+      yield* observed.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+
+      assert.equal(session.status, "ready");
+      assert.deepEqual(sends, ["/usage"]);
+    }),
+  );
+
+  it.effect("keeps the session usable when the runtime will not list its commands", () =>
+    Effect.gen(function* () {
+      const sends: Array<string> = [];
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("no-commands-session", {
+            listCommands: Effect.fail(
+              new SdkError({
+                operation: "listCommands",
+                kind: "failure",
+                detail: "commands unavailable",
+              }),
+            ),
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push(message.prompt);
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("no-commands-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      yield* adapter.sendTurn({ threadId, input: "/usage" });
+      const completed = yield* observed.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed",
+      );
+
+      assert.deepEqual(sends, ["/usage"]);
+      assert.deepEqual(completed.payload, { state: "completed" });
     }),
   );
 });
