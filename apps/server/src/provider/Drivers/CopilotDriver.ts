@@ -4,13 +4,17 @@ import {
   type ServerProviderModel,
   TextGenerationError,
 } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import { CopilotSdkRuntime } from "../CopilotSdkRuntime.ts";
@@ -19,6 +23,8 @@ import {
   buildInitialCopilotProviderSnapshot,
   checkCopilotProviderStatus,
 } from "../CopilotProvider.ts";
+import { makeCopilotAdapter } from "../Layers/CopilotAdapter.ts";
+import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { makeProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
@@ -91,6 +97,10 @@ function discoveryOnlyTextGeneration(): TextGeneration.TextGeneration["Service"]
 export type CopilotDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
   | ChildProcessSpawner.ChildProcessSpawner
+  | Crypto.Crypto
+  | FileSystem.FileSystem
+  | ProviderEventLoggers
+  | ServerConfig
   | ServerSettingsService;
 
 export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = {
@@ -106,6 +116,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const runtime = yield* CopilotSdkRuntime;
       const serverSettings = yield* ServerSettingsService;
+      const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -119,6 +130,31 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies CopilotSettings;
+      const adapter = enabled
+        ? yield* runtime
+            .connect({
+              binaryPath: effectiveConfig.binaryPath,
+              environment: processEnv,
+              platform: yield* HostProcessPlatform,
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderDriverError({
+                    driver: DRIVER_KIND,
+                    instanceId,
+                    detail: "Failed to connect the GitHub Copilot SDK runtime.",
+                    cause,
+                  }),
+              ),
+              Effect.flatMap((connection) =>
+                makeCopilotAdapter(connection, {
+                  instanceId,
+                  ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+                }),
+              ),
+            )
+        : discoveryOnlyAdapter();
       const lastModels = yield* Ref.make<ReadonlyArray<ServerProviderModel>>([]);
       const checkProvider = checkCopilotProviderStatus(effectiveConfig, processEnv, {
         lastModels,
@@ -156,7 +192,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         accentColor,
         enabled,
         snapshot,
-        adapter: discoveryOnlyAdapter(),
+        adapter,
         textGeneration: discoveryOnlyTextGeneration(),
       } satisfies ProviderInstance;
     }),

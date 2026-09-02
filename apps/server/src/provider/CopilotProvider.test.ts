@@ -76,6 +76,14 @@ function runtimeLayer(input: {
           return {
             authStatus: input.auth ?? Effect.succeed(authenticated),
             models: input.models ?? Effect.succeed(inventory),
+            createSession: () =>
+              Effect.fail(
+                new CopilotSdkRuntimeError({
+                  operation: "createSession",
+                  kind: "failure",
+                  detail: "not used by provider discovery tests",
+                }),
+              ),
           };
         }),
         () => Effect.sync(() => input.stops?.push(1)),
@@ -114,7 +122,7 @@ describe("checkCopilotProviderStatus", () => {
       ).pipe(Effect.provide(provide(runtimeLayer({ starts, stops, connections }))));
 
       expect(snapshot.status).toBe("ready");
-      expect(snapshot.supportsThreadExecution).toBe(false);
+      expect(snapshot.supportsThreadExecution).toBe(true);
       expect(snapshot.auth).toMatchObject({ status: "authenticated", label: "octocat" });
       expect(snapshot.models.map((model) => model.slug)).toEqual(["gpt-5.4"]);
       expect(starts).toHaveLength(1);

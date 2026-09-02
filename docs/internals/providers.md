@@ -53,16 +53,18 @@ launches the user's separately installed `copilot` executable over the stable fi
 keychain or supported environment variables; T3 Code does not copy or persist them.
 
 The `CopilotSdkRuntime` service is the single test injection seam for SDK startup, cleanup,
-authentication, status, models, failures, and timeouts. Production resolves bare executable names
-against the provider-instance environment, Windows `PATHEXT`, and conservative GUI install paths
-before opening stdio. A successful account inventory is authoritative and its first entry is the
-live preferred default. Failed refreshes retain the last successful catalog, and no static model is
-invented.
+authentication, status, models, sessions, failures, and timeouts. Production resolves bare
+executable names against the provider-instance environment, Windows `PATHEXT`, and conservative GUI
+install paths before opening stdio. A successful account inventory is authoritative and its first
+entry is the live preferred default. Failed refreshes retain the last successful catalog, and no
+static model is invented.
 
-This discovery slice intentionally exposes no thread runtime yet. The adapter registered on the
-instance rejects thread and text-generation operations until the subsequent Copilot runtime slices
-implement those behaviors. Its snapshot sets `supportsThreadExecution: false`, which keeps the live
-account catalog out of web and mobile thread pickers while still exposing it for provider health.
+Each enabled provider instance owns one scoped SDK client and its own map of T3 thread ids to SDK
+sessions. The Copilot adapter maps SDK assistant, reasoning, tool, usage, and idle events onto
+canonical runtime events. Its thread snapshots retain the provider events grouped under the T3 turn
+that observed them. Stopping an instance disconnects all of its sessions before the SDK client scope
+closes. Attachments are accepted only after resolving a known T3 attachment id inside the configured
+attachment store.
 
 ### Grok health check
 

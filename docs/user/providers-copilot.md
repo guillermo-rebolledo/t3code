@@ -24,5 +24,6 @@ Multiple Copilot provider instances may use different executable paths or enviro
 configuration changes where Copilot stores its state, the instances share the operating-system
 Copilot credential store.
 
-This release establishes Copilot discovery and configuration. Starting Copilot-backed threads is
-not available in this slice yet.
+Copilot-backed threads support ordinary prompts, uploaded images and files, streaming assistant and
+reasoning output, tool progress, usage updates, and stopping. Uploaded attachments are resolved from
+T3 Code's attachment store; arbitrary server paths are never accepted as attachment identifiers.
