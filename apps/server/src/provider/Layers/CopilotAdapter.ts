@@ -11,11 +11,13 @@ import {
   type ProviderSendTurnInput,
   type ProviderSession,
   type ProviderSessionStartInput,
+  type RuntimeEventRaw,
   RuntimeItemId,
   RuntimeRequestId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -32,6 +34,12 @@ import type {
   CopilotSdkRuntimeError,
   CopilotSdkSession,
 } from "../CopilotSdkRuntime.ts";
+import {
+  copilotSlashCommandNames,
+  mapCopilotSlashCommands,
+  parseCopilotSlashCommand,
+  resolveCopilotCommandOutcome,
+} from "../CopilotCommands.ts";
 import { buildCopilotContinuation, resolveCopilotContinuation } from "../CopilotContinuation.ts";
 import { resolveCopilotModelOptions } from "../CopilotSdkModels.ts";
 import {
@@ -50,6 +58,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("copilot");
+const COMMAND_DISCOVERY_TIMEOUT = "10 seconds";
 
 export interface CopilotAdapterOptions {
   readonly instanceId?: ProviderInstanceId;
@@ -71,6 +80,12 @@ interface CopilotSessionContext {
   readonly sdk: CopilotSdkSession;
   /** Canonical form of the selection already applied, so an unchanged one is free. */
   appliedModelKey: string | undefined;
+  /**
+   * The advertised command names for this session's working directory, so a
+   * prompt naming one routes to Copilot's command RPC and everything else,
+   * including unknown slash text, is sent as an ordinary prompt.
+   */
+  readonly commandNames: ReadonlySet<string>;
   readonly turns: Array<CopilotTurnState>;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly deniedToolCallIds: Set<string>;
@@ -308,13 +323,20 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     );
   };
 
+  /** The `raw` envelope for anything the runtime itself emitted. */
+  const sdkEventRaw = (event: SessionEvent): RuntimeEventRaw => ({
+    source: "copilot.sdk.event",
+    messageType: event.type,
+    payload: event,
+  });
+
   const emitItemStarted = Effect.fn("CopilotAdapter.emitItemStarted")(function* (
     context: CopilotSessionContext,
     turn: CopilotTurnState,
     key: string,
     itemId: RuntimeItemId,
     itemType: "assistant_message" | "reasoning" | "dynamic_tool_call",
-    event: SessionEvent,
+    raw: RuntimeEventRaw,
     data?: unknown,
     title?: string,
   ) {
@@ -332,7 +354,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         ...(title ? { title } : {}),
         ...(data !== undefined ? { data } : {}),
       },
-      raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+      raw,
     });
   });
 
@@ -343,10 +365,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     itemType: "assistant_message" | "reasoning",
     streamKind: "assistant_text" | "reasoning_text",
     delta: string,
-    event: SessionEvent,
+    raw: RuntimeEventRaw,
   ) {
     const itemId = RuntimeItemId.make(key);
-    yield* emitItemStarted(context, turn, key, itemId, itemType, event);
+    yield* emitItemStarted(context, turn, key, itemId, itemType, raw);
     turn.streamedItems.add(key);
     const base = yield* baseEvent(context.session.threadId, turn.id);
     yield* emit({
@@ -355,7 +377,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       itemId,
       providerRefs: { providerItemId: ProviderItemId.make(key) },
       payload: { streamKind, delta },
-      raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+      raw,
     });
   });
 
@@ -367,12 +389,12 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     streamKind: "assistant_text" | "reasoning_text",
     content: string,
     data: unknown,
-    event: SessionEvent,
+    raw: RuntimeEventRaw,
   ) {
     const itemId = RuntimeItemId.make(key);
-    yield* emitItemStarted(context, turn, key, itemId, itemType, event);
+    yield* emitItemStarted(context, turn, key, itemId, itemType, raw);
     if (content && !turn.streamedItems.has(key)) {
-      yield* emitTextDelta(context, turn, key, itemType, streamKind, content, event);
+      yield* emitTextDelta(context, turn, key, itemType, streamKind, content, raw);
     }
     const base = yield* baseEvent(context.session.threadId, turn.id);
     yield* emit({
@@ -381,8 +403,38 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       itemId,
       providerRefs: { providerItemId: ProviderItemId.make(key) },
       payload: { itemType, status: "completed", data },
-      raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+      raw,
     });
+  });
+
+  /**
+   * Renders a command's own output as one assistant message. Commands that
+   * answer directly - usage, help, a subcommand list - produce no session
+   * events, so the turn would otherwise show nothing at all.
+   */
+  const emitCommandOutput = Effect.fn("CopilotAdapter.emitCommandOutput")(function* (
+    context: CopilotSessionContext,
+    turn: CopilotTurnState,
+    text: string,
+    payload: unknown,
+  ) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const key = `copilot-command-${yield* crypto.randomUUIDv4.pipe(Effect.orDie)}`;
+    yield* emitTextCompleted(
+      context,
+      turn,
+      key,
+      "assistant_message",
+      "assistant_text",
+      trimmed,
+      payload,
+      {
+        source: "copilot.sdk.command",
+        method: "commands.invoke",
+        payload,
+      },
+    );
   });
 
   /** Releases every open approval so no request outlives the work that opened it. */
@@ -429,9 +481,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       ...base,
       type: "turn.completed",
       payload,
-      ...(event
-        ? { raw: { source: "copilot.sdk.event", messageType: event.type, payload: event } }
-        : {}),
+      ...(event ? { raw: sdkEventRaw(event) } : {}),
     });
   });
 
@@ -479,7 +529,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         ...base,
         type: "session.exited",
         payload: { reason, recoverable: false, exitKind: failed ? "error" : "graceful" },
-        raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+        raw: sdkEventRaw(event),
       });
     },
   );
@@ -521,7 +571,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           event.data.messageId,
           itemId,
           "assistant_message",
-          event,
+          sdkEventRaw(event),
         );
         break;
       }
@@ -534,7 +584,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           "assistant_message",
           "assistant_text",
           event.data.deltaContent,
-          event,
+          sdkEventRaw(event),
         );
         break;
       }
@@ -548,7 +598,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           "assistant_text",
           event.data.content,
           event.data,
-          event,
+          sdkEventRaw(event),
         );
         break;
       }
@@ -561,7 +611,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           "reasoning",
           "reasoning_text",
           event.data.deltaContent,
-          event,
+          sdkEventRaw(event),
         );
         break;
       }
@@ -575,7 +625,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           "reasoning_text",
           event.data.content,
           event.data,
-          event,
+          sdkEventRaw(event),
         );
         break;
       }
@@ -589,7 +639,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           key,
           RuntimeItemId.make(key),
           "dynamic_tool_call",
-          event,
+          sdkEventRaw(event),
           event.data,
           event.data.toolName,
         );
@@ -615,7 +665,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
                 : event.data.partialOutput,
             data: event.data,
           },
-          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+          raw: sdkEventRaw(event),
         });
         break;
       }
@@ -635,7 +685,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
             ...(event.data.error?.message ? { detail: event.data.error.message } : {}),
             data: event.data,
           },
-          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+          raw: sdkEventRaw(event),
         });
         break;
       }
@@ -665,7 +715,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
               ...(event.data.duration === undefined ? {} : { durationMs: event.data.duration }),
             },
           },
-          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+          raw: sdkEventRaw(event),
         });
         break;
       }
@@ -677,7 +727,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           payload: {
             usage: { usedTokens: event.data.currentTokens, maxTokens: event.data.tokenLimit },
           },
-          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+          raw: sdkEventRaw(event),
         });
         break;
       }
@@ -709,11 +759,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         const message = event.data.message.trim() || "GitHub Copilot reported an error.";
         const recoverable = isRecoverableSessionError(event.data);
         const base = yield* baseEvent(threadId, turn?.id);
-        const raw = {
-          source: "copilot.sdk.event" as const,
-          messageType: event.type,
-          payload: event,
-        };
+        const raw = sdkEventRaw(event);
         if (recoverable) {
           yield* emit({
             ...base,
@@ -875,6 +921,19 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       : connection
           .createSession(sdkInput)
           .pipe(Effect.mapError((error) => mapSdkError("createSession", error)));
+    // A runtime that will not - or will not promptly - list its commands costs
+    // the user command routing for this session, never the session itself.
+    const commandNames = yield* sdk.listCommands.pipe(
+      Effect.map((commands) => copilotSlashCommandNames(mapCopilotSlashCommands(commands))),
+      Effect.timeout(COMMAND_DISCOVERY_TIMEOUT),
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("GitHub Copilot slash command discovery failed.", {
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(new Set<string>() as ReadonlySet<string>)),
+      ),
+    );
     const createdAt = yield* nowIso;
     const session: ProviderSession = {
       provider: PROVIDER,
@@ -892,6 +951,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       session,
       sdk,
       appliedModelKey: modelSelectionKey(input.modelSelection, instanceId),
+      commandNames,
       turns: [],
       pendingApprovals: new Map(),
       deniedToolCallIds: new Set(),
@@ -985,41 +1045,75 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       payload: context.session.model ? { model: context.session.model } : {},
     });
 
-    const sendResult = yield* context.sdk
-      .send({
-        prompt: input.input?.trim() ?? "",
-        ...(attachments.length > 0 ? { attachments } : {}),
-      })
-      .pipe(
-        // A send left hanging by a dead runtime must not pin the request
-        // forever; session teardown releases it.
+    /**
+     * Anything the runtime may never answer races session teardown, so a dead
+     * Copilot cannot pin the request forever.
+     */
+    const untilTerminated = <A, E>(
+      effect: Effect.Effect<A, E>,
+      request: { readonly method: string; readonly detail: string },
+    ) =>
+      effect.pipe(
         Effect.raceFirst(
           Deferred.await(context.terminated).pipe(
-            Effect.andThen(
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "send",
-                detail: "The GitHub Copilot session ended before the message was accepted.",
-              }),
-            ),
+            Effect.andThen(new ProviderAdapterRequestError({ provider: PROVIDER, ...request })),
           ),
         ),
         Effect.result,
       );
-    if (sendResult._tag === "Failure") {
-      if (turn.settled) {
-        // The turn already settled - an interrupt, a runtime error, or a
-        // session stop - and this rejection is a consequence of that, not a new
-        // failure to report on top of it.
+
+    /**
+     * A turn that never reached the runtime fails once here. A turn that
+     * already settled swallows the rejection: it is a consequence of the
+     * interrupt, runtime error, or stop that settled it, not a new failure.
+     */
+    const failTurn = Effect.fn("CopilotAdapter.failTurn")(function* (
+      method: string,
+      failure: ProviderAdapterRequestError | CopilotSdkRuntimeError,
+    ) {
+      if (turn.settled) return;
+      yield* settleTurn(context, turn, { state: "failed", errorMessage: failure.detail });
+      return yield* failure._tag === "ProviderAdapterRequestError"
+        ? failure
+        : mapSdkError(method, failure);
+    });
+
+    // Only a command Copilot advertised for this session is routed to its
+    // command RPC. Unknown slash text is prose and goes out as written.
+    const command = parseCopilotSlashCommand(input.input?.trim() ?? "", context.commandNames);
+    let prompt = input.input?.trim() ?? "";
+    if (command) {
+      const invocation = yield* untilTerminated(context.sdk.invokeCommand(command), {
+        method: "commands.invoke",
+        detail: "The GitHub Copilot session ended before the command was invoked.",
+      });
+      if (invocation._tag === "Failure") {
+        yield* failTurn("invokeCommand", invocation.failure);
         return { threadId: input.threadId, turnId };
       }
-      yield* settleTurn(context, turn, {
-        state: "failed",
-        errorMessage: sendResult.failure.detail,
-      });
-      return yield* sendResult.failure._tag === "ProviderAdapterRequestError"
-        ? sendResult.failure
-        : mapSdkError("send", sendResult.failure);
+      const outcome = resolveCopilotCommandOutcome(invocation.success);
+      if (outcome.kind === "text") {
+        // The command answered on its own; there is no agent turn to wait for.
+        yield* emitCommandOutput(context, turn, outcome.text, invocation.success);
+        yield* settleTurn(context, turn, { state: "completed" });
+        return { threadId: input.threadId, turnId };
+      }
+      prompt = outcome.prompt;
+    }
+
+    const sendResult = yield* untilTerminated(
+      context.sdk.send({
+        prompt,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      }),
+      {
+        method: "send",
+        detail: "The GitHub Copilot session ended before the message was accepted.",
+      },
+    );
+    if (sendResult._tag === "Failure") {
+      yield* failTurn("send", sendResult.failure);
+      return { threadId: input.threadId, turnId };
     }
     return { threadId: input.threadId, turnId };
   });

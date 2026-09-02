@@ -17,6 +17,11 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
+import type {
+  CopilotCommandInfo,
+  CopilotCommandInvocationResult,
+  CopilotSlashCommandInvocation,
+} from "./CopilotCommands.ts";
 import { resolveCopilotExecutable } from "./CopilotExecutable.ts";
 
 /** The SDK does not re-export these unions from its entrypoint. */
@@ -24,6 +29,16 @@ type ReasoningEffort = NonNullable<SessionConfigBase["reasoningEffort"]>;
 type ContextTier = NonNullable<SessionConfigBase["contextTier"]>;
 
 const DEFAULT_START_TIMEOUT_MS = 8_000;
+/**
+ * Copilot's own commands and its user-invocable skills, but not commands an
+ * SDK client registered: T3 registers none, and a command it cannot run has no
+ * business in the composer.
+ */
+const COMMAND_LIST_FILTERS = {
+  includeBuiltins: true,
+  includeSkills: true,
+  includeClientCommands: false,
+} as const;
 const STOP_TIMEOUT_MS = 2_000;
 
 export class CopilotSdkRuntimeError extends Schema.TaggedErrorClass<CopilotSdkRuntimeError>()(
@@ -128,6 +143,21 @@ export interface CopilotSdkConnection {
   readonly resumeSession: (
     input: CopilotSdkSessionResumeInput,
   ) => Effect.Effect<CopilotSdkSession, CopilotSdkRuntimeError>;
+  /**
+   * The slash commands Copilot advertises for one working directory. A
+   * throwaway session is what scopes the answer: the runtime resolves a
+   * project's own commands from the directory the session opened in.
+   */
+  readonly workspaceCommands: (
+    cwd: string,
+  ) => Effect.Effect<ReadonlyArray<CopilotCommandInfo>, CopilotSdkRuntimeError>;
+  /**
+   * The skill inventory Copilot discovers for one project directory, returned
+   * unparsed so malformed entries are rejected by T3's own mapping.
+   */
+  readonly workspaceSkills: (
+    cwd: string,
+  ) => Effect.Effect<ReadonlyArray<unknown>, CopilotSdkRuntimeError>;
 }
 
 /** Model and per-model settings the runtime accepts at start, resume, and switch. */
@@ -176,6 +206,11 @@ export interface CopilotSdkSession {
   readonly setModel: (
     options: CopilotSdkModelOptions,
   ) => Effect.Effect<void, CopilotSdkRuntimeError>;
+  /** The commands this session can run, used to route the user's slash text. */
+  readonly listCommands: Effect.Effect<ReadonlyArray<CopilotCommandInfo>, CopilotSdkRuntimeError>;
+  readonly invokeCommand: (
+    input: CopilotSlashCommandInvocation,
+  ) => Effect.Effect<CopilotCommandInvocationResult, CopilotSdkRuntimeError>;
   readonly rewindPoints: Effect.Effect<CopilotSdkRewindPoints, CopilotSdkRuntimeError>;
   readonly rewind: (
     eventId: string,
@@ -192,6 +227,11 @@ function wrapSession(
     abort: sdkEffect("abort", () => session.abort()).pipe(Effect.asVoid),
     setModel: (options) =>
       sdkEffect("setModel", () => session.setModel(options.model, modelSettings(options))),
+    listCommands: sdkEffect("listCommands", () =>
+      session.rpc.commands.list(COMMAND_LIST_FILTERS),
+    ).pipe(Effect.map((result) => result.commands)),
+    invokeCommand: (input) =>
+      sdkEffect("invokeCommand", () => session.rpc.commands.invoke({ ...input })),
     rewindPoints: sdkEffect("listRewindPoints", () => session.rpc.history.listRewindPoints()).pipe(
       Effect.map((result) => ({
         // Autopilot continuations are turns the runtime injected on its own;
@@ -301,6 +341,27 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
         sdkEffect("resumeSession", () =>
           client.resumeSession(input.sessionId, sessionConfig(input)),
         ).pipe(Effect.map(wrapSession)),
+      workspaceCommands: (cwd) =>
+        sdkEffect("workspaceCommands", async () => {
+          const session = await client.createSession({
+            workingDirectory: cwd,
+            enableConfigDiscovery: true,
+            enableSkills: true,
+            // A discovery session never runs a turn; refusing outright keeps a
+            // runtime that asks anyway from waiting on nobody.
+            onPermissionRequest: () => Promise.resolve({ kind: "reject" as const }),
+          });
+          try {
+            const result = await session.rpc.commands.list(COMMAND_LIST_FILTERS);
+            return result.commands;
+          } finally {
+            await session.disconnect().catch(() => undefined);
+          }
+        }),
+      workspaceSkills: (cwd) =>
+        sdkEffect("workspaceSkills", () =>
+          client.rpc.skills.discover({ projectPaths: [cwd] }),
+        ).pipe(Effect.map((result) => result.skills)),
     };
   }),
 };

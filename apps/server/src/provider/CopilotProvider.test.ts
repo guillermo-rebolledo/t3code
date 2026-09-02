@@ -88,6 +88,8 @@ function runtimeLayer(input: {
             models: input.models ?? Effect.succeed(inventory),
             createSession: () => unusedSession("createSession"),
             resumeSession: () => unusedSession("resumeSession"),
+            workspaceCommands: () => unusedSession("workspaceCommands"),
+            workspaceSkills: () => unusedSession("workspaceSkills"),
           };
         }),
         () => Effect.sync(() => input.stops?.push(1)),

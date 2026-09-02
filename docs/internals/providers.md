@@ -83,6 +83,24 @@ reports one `session.exited` whose exit kind reflects whether Copilot crashed. I
 runtime shutdown, and a session stop all release the session's open approvals, and teardown also
 releases a send the runtime never answered, so nothing outlives the work that opened it.
 
+Commands and skills are workspace data, not machine data. `CopilotDriver.snapshotForCwd` reads them
+through the instance's existing SDK connection - `workspaceCommands` opens a throwaway session in
+that directory for Copilot's own command list, `workspaceSkills` discovers the project's skills -
+and the registry files the result under that `cwd`. Neither read can fail the caller: a refused or
+hanging discovery costs the user the catalog for one directory and nothing else, and the
+instance-wide snapshot advertises no commands or skills at all. Malformed skill entries are dropped
+individually, and a source T3 does not recognise is published without a scope rather than under a
+guessed one.
+
+A turn whose prompt names a command the session advertised is invoked through `commands.invoke`;
+everything else, including slash text naming a command Copilot did not advertise, goes out through
+`send` unchanged. Commands T3 Code owns through its own interface - `model`, `plan`, `default` -
+never reach the catalog, so they cannot be routed either. A command that answers with an agent
+prompt becomes that turn's message and settles through the normal event path; one that answers
+directly is rendered as a single assistant message and settles the turn on the spot, because it
+produces no session events of its own. A refused invocation fails the turn exactly once, through the
+same settlement path as a refused send.
+
 ### Grok health check
 
 `checkGrokProviderStatus` never opens an ACP session. It runs `grok --version`, then `grok models`
