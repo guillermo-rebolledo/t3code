@@ -15,12 +15,28 @@ allowBuilds:
   electron: true
   electron-winstaller: false
   esbuild: true
+  # Used only by the SDK's experimental in-process FFI transport. Copilot
+  # provider instances use the separately installed CLI over stdio.
+  koffi: false
   msgpackr-extract: true
   msw: false
   node-pty: true
   sharp: true
   utf-8-validate: false
   workerd: false
+
+# The first-party SDK declares the packaged Copilot runtimes as optional
+# dependencies for its fallback launcher. T3 Code always supplies the user's
+# separately installed executable over stdio, so none of those binaries ship.
+ignoredOptionalDependencies:
+  - "@github/copilot-darwin-arm64"
+  - "@github/copilot-darwin-x64"
+  - "@github/copilot-linux-arm64"
+  - "@github/copilot-linux-x64"
+  - "@github/copilot-linuxmusl-arm64"
+  - "@github/copilot-linuxmusl-x64"
+  - "@github/copilot-win32-arm64"
+  - "@github/copilot-win32-x64"
 
 catalog:
   "@clerk/backend": 3.14.0

@@ -21,6 +21,7 @@
  * @module provider/builtInDrivers
  */
 import { ClaudeDriver, type ClaudeDriverEnv } from "./Drivers/ClaudeDriver.ts";
+import { CopilotDriver, type CopilotDriverEnv } from "./Drivers/CopilotDriver.ts";
 import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
 import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
 import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
@@ -34,6 +35,7 @@ import type { AnyProviderDriver } from "./ProviderDriver.ts";
  */
 export type BuiltInDriversEnv =
   | ClaudeDriverEnv
+  | CopilotDriverEnv
   | CodexDriverEnv
   | CursorDriverEnv
   | GrokDriverEnv
@@ -50,4 +52,5 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
   CursorDriver,
   GrokDriver,
   OpenCodeDriver,
+  CopilotDriver,
 ];

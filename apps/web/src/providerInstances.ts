@@ -72,7 +72,12 @@ export interface ProviderInstanceEntry {
  * `ready` probe status can remain in the streamed snapshot until reconciliation.
  */
 export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled && entry.isAvailable && entry.status === "ready";
+  return (
+    entry.enabled &&
+    entry.isAvailable &&
+    entry.status === "ready" &&
+    entry.snapshot.supportsThreadExecution !== false
+  );
 }
 
 /** Picker rails contain configured, enabled instances only. */
@@ -327,7 +332,7 @@ export function getDefaultProviderInstanceModel(
 }
 
 const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolean =>
-  entry.enabled && entry.isAvailable;
+  entry.enabled && entry.isAvailable && entry.snapshot.supportsThreadExecution !== false;
 
 /**
  * Resolve an exact stored instance when it remains enabled and available.

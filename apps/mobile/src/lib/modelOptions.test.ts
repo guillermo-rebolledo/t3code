@@ -12,6 +12,30 @@ import {
 } from "./modelOptions";
 
 describe("mobile model options", () => {
+  it("excludes models from discovery-only providers that cannot start threads", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "copilot_work",
+          driver: "copilot",
+          enabled: true,
+          installed: true,
+          supportsThreadExecution: false,
+          auth: { status: "authenticated" },
+          models: [{ slug: "gpt-5.4", name: "GPT-5.4", isCustom: false, capabilities: null }],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    expect(buildModelOptions(config, null)).toEqual([]);
+    expect(
+      buildModelOptions(config, {
+        instanceId: ProviderInstanceId.make("copilot_work"),
+        model: "gpt-5.4",
+      }),
+    ).toEqual([]);
+  });
+
   it("groups models by provider and flags legacy entries", () => {
     const config = {
       providers: [
@@ -172,6 +196,15 @@ describe("mobile model options", () => {
           auth: { status: "authenticated" },
           models: [],
         },
+        {
+          instanceId: "copilot_work",
+          driver: "copilot",
+          enabled: true,
+          installed: true,
+          supportsThreadExecution: false,
+          auth: { status: "authenticated" },
+          models: [],
+        },
       ],
     } as unknown as ServerConfig;
 
@@ -187,10 +220,15 @@ describe("mobile model options", () => {
       instanceId: ProviderInstanceId.make("codex_personal"),
       model: "gpt-5.6-sol",
     };
+    const discoveryOnly = {
+      instanceId: ProviderInstanceId.make("copilot_work"),
+      model: "gpt-5.4",
+    };
 
     expect(resolveSelectableModelSelection(config, usable)).toBe(usable);
     expect(resolveSelectableModelSelection(config, disabled)).toBeNull();
     expect(resolveSelectableModelSelection(config, removed)).toBeNull();
+    expect(resolveSelectableModelSelection(config, discoveryOnly)).toBeNull();
     // No config (environment offline) — nothing to validate against.
     expect(resolveSelectableModelSelection(null, disabled)).toBe(disabled);
   });

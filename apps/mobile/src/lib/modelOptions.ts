@@ -80,6 +80,7 @@ export function resolveSelectableModelSelection(
   return provider &&
     provider.enabled &&
     provider.installed &&
+    provider.supportsThreadExecution !== false &&
     provider.auth.status !== "unauthenticated"
     ? selection
     : null;
@@ -128,7 +129,12 @@ export function buildModelOptions(
   const options = new Map<string, ModelOption>();
 
   for (const provider of config?.providers ?? []) {
-    if (!provider.enabled || !provider.installed || provider.auth.status === "unauthenticated") {
+    if (
+      !provider.enabled ||
+      !provider.installed ||
+      provider.supportsThreadExecution === false ||
+      provider.auth.status === "unauthenticated"
+    ) {
       continue;
     }
 
@@ -156,7 +162,12 @@ export function buildModelOptions(
     }
   }
 
-  if (fallbackModelSelection) {
+  const fallbackProvider = fallbackModelSelection
+    ? config?.providers.find(
+        (provider) => provider.instanceId === fallbackModelSelection.instanceId,
+      )
+    : undefined;
+  if (fallbackModelSelection && fallbackProvider?.supportsThreadExecution !== false) {
     const key = `${fallbackModelSelection.instanceId}:${fallbackModelSelection.model}`;
     const existing = options.get(key);
     if (existing) {

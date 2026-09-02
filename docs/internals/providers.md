@@ -7,7 +7,7 @@ orchestration layer does not know which one is behind a thread.
 
 ## Built-in drivers
 
-[`builtInDrivers.ts`][drivers] exports `BUILT_IN_DRIVERS` with five entries:
+[`builtInDrivers.ts`][drivers] exports `BUILT_IN_DRIVERS` with six entries:
 
 | Driver kind   | Driver source                           |
 | ------------- | --------------------------------------- |
@@ -16,6 +16,7 @@ orchestration layer does not know which one is behind a thread.
 | `cursor`      | [`Drivers/CursorDriver.ts`][cursor]     |
 | `grok`        | [`Drivers/GrokDriver.ts`][grok]         |
 | `opencode`    | [`Drivers/OpenCodeDriver.ts`][opencode] |
+| `copilot`     | [`Drivers/CopilotDriver.ts`][copilot]   |
 
 Each driver declares its `driverKind`, a `configSchema`, and a `create` function that builds an
 adapter in a child scope. Adapter implementations live beside them in
@@ -42,6 +43,26 @@ assistant text. Persisted messages keep their serialized links.
 
 Adding a driver means writing the driver plus adapter and adding it to `BUILT_IN_DRIVERS`. No
 orchestration, contract, or client change is required for the common case.
+
+### GitHub Copilot discovery
+
+Copilot is an explicit provider-instance-only driver; it has no legacy `providers.copilot` mirror,
+so merely upgrading the server never creates or starts a Copilot instance. Each configured instance
+launches the user's separately installed `copilot` executable over the stable first-party
+`@github/copilot-sdk` stdio transport. The CLI continues to own credentials in the operating-system
+keychain or supported environment variables; T3 Code does not copy or persist them.
+
+The `CopilotSdkRuntime` service is the single test injection seam for SDK startup, cleanup,
+authentication, status, models, failures, and timeouts. Production resolves bare executable names
+against the provider-instance environment, Windows `PATHEXT`, and conservative GUI install paths
+before opening stdio. A successful account inventory is authoritative and its first entry is the
+live preferred default. Failed refreshes retain the last successful catalog, and no static model is
+invented.
+
+This discovery slice intentionally exposes no thread runtime yet. The adapter registered on the
+instance rejects thread and text-generation operations until the subsequent Copilot runtime slices
+implement those behaviors. Its snapshot sets `supportsThreadExecution: false`, which keeps the live
+account catalog out of web and mobile thread pickers while still exposing it for provider health.
 
 ### Grok health check
 
@@ -180,6 +201,7 @@ when a request opens (approval) or user input is requested, via
 [cursor]: ../../apps/server/src/provider/Drivers/CursorDriver.ts
 [grok]: ../../apps/server/src/provider/Drivers/GrokDriver.ts
 [opencode]: ../../apps/server/src/provider/Drivers/OpenCodeDriver.ts
+[copilot]: ../../apps/server/src/provider/Drivers/CopilotDriver.ts
 [opencode-server-owner]: ../../apps/server/src/provider/OpenCodeServerOwner.ts
 [adapter]: ../../apps/server/src/provider/Services/ProviderAdapter.ts
 [instances]: ../../apps/server/src/provider/Services/ProviderInstanceRegistry.ts
