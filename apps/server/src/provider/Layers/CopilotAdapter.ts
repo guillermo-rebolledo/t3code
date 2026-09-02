@@ -6,6 +6,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderItemId,
+  type ModelSelection,
   type ProviderRuntimeEvent,
   type ProviderSendTurnInput,
   type ProviderSession,
@@ -28,9 +29,16 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import type {
   CopilotSdkConnection,
+  CopilotSdkModelOptions,
   CopilotSdkRuntimeError,
   CopilotSdkSession,
 } from "../CopilotSdkRuntime.ts";
+import {
+  buildCopilotContinuation,
+  resolveCopilotContinuation,
+  resolveCopilotModelOptions,
+  sameCopilotModelOptions,
+} from "../CopilotContinuation.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -66,6 +74,8 @@ interface CopilotTurnState {
 interface CopilotSessionContext {
   session: ProviderSession;
   readonly sdk: CopilotSdkSession;
+  /** Model and options currently applied to the live session, if any. */
+  modelOptions: CopilotSdkModelOptions | undefined;
   readonly turns: Array<CopilotTurnState>;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly deniedToolCallIds: Set<string>;
@@ -764,6 +774,34 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     }
   });
 
+  /**
+   * Turns a T3 model selection into the runtime's model settings, refusing a
+   * model or option this account cannot use. Selections aimed at another
+   * provider instance are not this adapter's business and resolve to nothing.
+   */
+  const resolveModelOptions = Effect.fn("CopilotAdapter.resolveModelOptions")(function* (
+    operation: string,
+    selection: ModelSelection | undefined,
+  ) {
+    if (!selection || selection.instanceId !== instanceId) return undefined;
+    const inventory = yield* connection.models.pipe(
+      Effect.mapError((error) => mapSdkError("listModels", error)),
+    );
+    const resolved = resolveCopilotModelOptions({
+      model: selection.model,
+      selections: selection.options,
+      inventory,
+    });
+    if (resolved.kind === "invalid") {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation,
+        issue: resolved.issue,
+      });
+    }
+    return resolved.options;
+  });
+
   const startSession = Effect.fn("CopilotAdapter.startSession")(function* (
     input: ProviderSessionStartInput,
   ) {
@@ -788,6 +826,18 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         issue: "cwd is required and must be non-empty.",
       });
     }
+    // A cursor that cannot be honored fails before anything is torn down, so a
+    // thread with unusable continuation state keeps the session it still has.
+    const continuation = resolveCopilotContinuation(input.resumeCursor, instanceId);
+    if (continuation.kind === "invalid") {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "startSession",
+        issue: continuation.issue,
+      });
+    }
+    const modelOptions = yield* resolveModelOptions("startSession", input.modelSelection);
+
     const existing = sessions.get(input.threadId);
     if (existing) yield* stopSessionInternal(existing, false);
 
@@ -801,16 +851,18 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     };
     const sdkInput = {
       workingDirectory: input.cwd.trim(),
-      ...(input.modelSelection?.instanceId === instanceId && input.modelSelection.model
-        ? { model: input.modelSelection.model }
-        : {}),
+      ...(modelOptions ? { modelOptions } : {}),
       onEvent,
       onPermissionRequest: (payload: unknown) =>
         runPromise(handlePermissionRequest(threadId, payload)),
     };
-    const sdk = yield* connection
-      .createSession(sdkInput)
-      .pipe(Effect.mapError((error) => mapSdkError("createSession", error)));
+    const sdk = yield* continuation.kind === "resume"
+      ? connection
+          .resumeSession({ ...sdkInput, sessionId: continuation.sessionId })
+          .pipe(Effect.mapError((error) => mapSdkError("resumeSession", error)))
+      : connection
+          .createSession(sdkInput)
+          .pipe(Effect.mapError((error) => mapSdkError("createSession", error)));
     const createdAt = yield* nowIso;
     const session: ProviderSession = {
       provider: PROVIDER,
@@ -818,16 +870,16 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       status: "ready",
       runtimeMode: input.runtimeMode,
       cwd: input.cwd.trim(),
-      ...(input.modelSelection?.instanceId === instanceId
-        ? { model: input.modelSelection.model }
-        : {}),
+      ...(modelOptions ? { model: modelOptions.model } : {}),
       threadId,
+      resumeCursor: buildCopilotContinuation({ instanceId, sessionId: sdk.sessionId }),
       createdAt,
       updatedAt: createdAt,
     };
     sessions.set(threadId, {
       session,
       sdk,
+      modelOptions,
       turns: [],
       pendingApprovals: new Map(),
       deniedToolCallIds: new Set(),
@@ -875,6 +927,21 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         });
       }
       attachments.push({ type: "file", path: resolved, displayName: attachment.name });
+    }
+
+    // The switch lands before the turn exists, so a rejected model or option
+    // fails the request outright instead of stranding a started turn.
+    const requestedModel = yield* resolveModelOptions("sendTurn", input.modelSelection);
+    if (requestedModel && !sameCopilotModelOptions(requestedModel, context.modelOptions)) {
+      yield* context.sdk
+        .setModel(requestedModel)
+        .pipe(Effect.mapError((error) => mapSdkError("setModel", error)));
+      context.modelOptions = requestedModel;
+      context.session = {
+        ...context.session,
+        model: requestedModel.model,
+        updatedAt: yield* nowIso,
+      };
     }
 
     const turnId = TurnId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
@@ -995,7 +1062,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     | ProviderAdapterValidationError
   > = {
     provider: PROVIDER,
-    capabilities: { sessionModelSwitch: "unsupported" },
+    capabilities: { sessionModelSwitch: "in-session" },
     startSession,
     sendTurn,
     interruptTurn,
@@ -1032,7 +1099,55 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
           turns: context.turns.map((turn) => ({ id: turn.id, items: [...turn.items] })),
         })),
       ),
-    rollbackThread: () => unsupported("rollbackThread"),
+    rollbackThread: Effect.fn("CopilotAdapter.rollbackThread")(function* (threadId, numTurns) {
+      const context = yield* requireSession(threadId);
+      if (!Number.isInteger(numTurns) || numTurns <= 0) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: `Rollback distance must be a positive whole number of turns, received ${numTurns}.`,
+        });
+      }
+      const rewindPoints = yield* context.sdk.rewindPoints.pipe(
+        Effect.mapError((error) => mapSdkError("listRewindPoints", error)),
+      );
+      if (rewindPoints.unavailableReason) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "listRewindPoints",
+          detail: `GitHub Copilot cannot rewind this session right now: ${rewindPoints.unavailableReason}.`,
+        });
+      }
+      const points = rewindPoints.points;
+      if (numTurns > points.length) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: `Cannot roll back ${numTurns} turn(s); this GitHub Copilot session has ${points.length}.`,
+        });
+      }
+      const boundary = points[points.length - numTurns];
+      const result = yield* context.sdk
+        .rewind(boundary!.eventId)
+        .pipe(Effect.mapError((error) => mapSdkError("rewind", error)));
+      // Only an outcome that actually truncated history may touch local state;
+      // anything else leaves the session exactly as the caller found it.
+      if (result.eventsRemoved === undefined) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "rewind",
+          detail: `GitHub Copilot did not roll back the conversation (${result.outcome})${
+            result.error ? `: ${result.error}` : "."
+          }`,
+        });
+      }
+      context.turns.splice(Math.max(0, context.turns.length - numTurns));
+      context.session = { ...context.session, updatedAt: yield* nowIso };
+      return {
+        threadId,
+        turns: context.turns.map((turn) => ({ id: turn.id, items: [...turn.items] })),
+      };
+    }),
     stopAll,
     streamEvents: Stream.fromPubSub(events),
   };

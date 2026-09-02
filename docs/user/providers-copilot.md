@@ -30,3 +30,18 @@ immediately and leaves the thread ready for the next message. If Copilot reports
 process ends unexpectedly, the turn stops with that reason instead of appearing to run forever.
 Uploaded attachments are resolved from T3 Code's attachment store; arbitrary server paths are never
 accepted as attachment identifiers.
+
+Copilot threads keep working across restarts. T3 Code remembers which Copilot session belongs to a
+thread and reattaches to it, so a thread you come back to continues where it left off. A thread that
+recorded a session belonging to a different Copilot provider instance, or one Copilot no longer has,
+reports why it cannot continue instead of silently starting a blank conversation.
+
+Restoring an earlier point in a Copilot thread rewinds the conversation Copilot holds along with the
+thread. Files come back through T3 Code's own checkpoints, so a restore never depends on Copilot's
+file history. If Copilot is busy or refuses the rewind, the thread stays exactly as it was and tells
+you why.
+
+Changing the model or a model option, such as reasoning effort or context window, applies to the
+running Copilot session and takes effect on your next message; the conversation is not restarted. A
+model your account cannot use, or an option a model does not offer, is reported instead of quietly
+falling back to a different one.
