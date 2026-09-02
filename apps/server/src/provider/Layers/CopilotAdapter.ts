@@ -1,6 +1,8 @@
 import type { MessageOptions, SessionEvent } from "@github/copilot-sdk";
 import {
+  ApprovalRequestId,
   EventId,
+  type ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderItemId,
@@ -9,6 +11,7 @@ import {
   type ProviderSession,
   type ProviderSessionStartInput,
   RuntimeItemId,
+  RuntimeRequestId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -32,6 +35,13 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
+import {
+  approvalDecisionResult,
+  approvalOptionsForPermission,
+  automaticPermissionResult,
+  canonicalPermissionRequest,
+  parseCopilotPermission,
+} from "../CopilotPermissions.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
@@ -54,8 +64,14 @@ interface CopilotSessionContext {
   session: ProviderSession;
   readonly sdk: CopilotSdkSession;
   readonly turns: Array<CopilotTurnState>;
+  readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
+  readonly deniedToolCallIds: Set<string>;
   activeTurn: CopilotTurnState | undefined;
   stopped: boolean;
+}
+
+interface PendingApproval {
+  readonly resolve: (decision: ProviderApprovalDecision) => void;
 }
 
 function errorDetail(error: unknown): string {
@@ -90,6 +106,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     Effect.orDie,
   );
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const runtimeContext = yield* Effect.context<never>();
+  const runPromise = Effect.runPromiseWith(runtimeContext);
 
   const emit = (event: ProviderRuntimeEvent) => PubSub.publish(events, event).pipe(Effect.asVoid);
   const stamp = () => Effect.all({ eventId: nextId, createdAt: nowIso });
@@ -102,6 +120,103 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       threadId,
       ...(turnId ? { turnId } : {}),
     }));
+
+  const handlePermissionRequest = Effect.fn("CopilotAdapter.handlePermissionRequest")(function* (
+    threadId: ThreadId,
+    payload: unknown,
+  ) {
+    const context = sessions.get(threadId);
+    const permission = parseCopilotPermission(payload);
+    if (!context || context.stopped || !permission) {
+      const base = yield* baseEvent(threadId, context?.activeTurn?.id);
+      yield* emit({
+        ...base,
+        type: "runtime.error",
+        payload: {
+          message: "Copilot sent an unknown or malformed permission request.",
+          class: "permission_error",
+          detail: payload,
+        },
+        raw: {
+          source: "copilot.sdk.permission",
+          method: "permission.malformed",
+          payload,
+        },
+      });
+      return { kind: "reject" } as const;
+    }
+
+    const automatic = automaticPermissionResult(context.session.runtimeMode, permission);
+    if (automatic) return automatic;
+
+    const requestId = ApprovalRequestId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    const canonical = canonicalPermissionRequest(permission);
+    let resolveDecision!: (decision: ProviderApprovalDecision) => void;
+    const decisionPromise = new Promise<ProviderApprovalDecision>((resolve) => {
+      resolveDecision = resolve;
+    });
+    context.pendingApprovals.set(requestId, { resolve: resolveDecision });
+    const openedBase = yield* baseEvent(threadId, context.activeTurn?.id);
+    yield* emit({
+      ...openedBase,
+      type: "request.opened",
+      requestId: RuntimeRequestId.make(requestId),
+      payload: {
+        requestType: canonical.requestType,
+        detail: canonical.detail,
+        ...(canonical.appName ? { appName: canonical.appName } : {}),
+        options: [...approvalOptionsForPermission(permission)],
+        args: permission,
+      },
+      raw: {
+        source: "copilot.sdk.permission",
+        method: "permission.requested",
+        payload,
+      },
+    });
+
+    const decision = yield* Effect.promise(() => decisionPromise).pipe(
+      Effect.ensuring(Effect.sync(() => context.pendingApprovals.delete(requestId))),
+    );
+    context.pendingApprovals.delete(requestId);
+    const result = approvalDecisionResult(decision, permission);
+    const resolvedBase = yield* baseEvent(threadId, context.activeTurn?.id);
+    yield* emit({
+      ...resolvedBase,
+      type: "request.resolved",
+      requestId: RuntimeRequestId.make(requestId),
+      payload: {
+        requestType: canonical.requestType,
+        decision,
+        resolution: result,
+      },
+      raw: {
+        source: "copilot.sdk.permission",
+        method: "permission.completed",
+        payload: { request: payload, decision },
+      },
+    });
+
+    if (result.kind === "reject" && permission.toolCallId) {
+      context.deniedToolCallIds.add(permission.toolCallId);
+      const turn = context.activeTurn;
+      if (turn?.startedItems.has(permission.toolCallId)) {
+        const deniedBase = yield* baseEvent(threadId, turn.id);
+        yield* emit({
+          ...deniedBase,
+          type: "item.completed",
+          itemId: RuntimeItemId.make(permission.toolCallId),
+          providerRefs: { providerItemId: ProviderItemId.make(permission.toolCallId) },
+          payload: {
+            itemType: "dynamic_tool_call",
+            status: "declined",
+            detail: "The user denied this tool request.",
+          },
+        });
+      }
+    }
+    return result;
+  });
 
   const requireSession = (
     threadId: ThreadId,
@@ -276,6 +391,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       case "tool.execution_start": {
         if (!turn) break;
         const key = event.data.toolCallId;
+        if (context.deniedToolCallIds.has(key)) break;
         yield* emitItemStarted(
           context,
           key,
@@ -291,6 +407,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       case "tool.execution_progress": {
         if (!turn) break;
         const key = event.data.toolCallId;
+        if (context.deniedToolCallIds.has(key)) break;
         const base = yield* baseEvent(threadId, turn.id);
         yield* emit({
           ...base,
@@ -313,6 +430,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       case "tool.execution_complete": {
         if (!turn) break;
         const key = event.data.toolCallId;
+        if (context.deniedToolCallIds.has(key)) break;
         const base = yield* baseEvent(threadId, turn.id);
         yield* emit({
           ...base,
@@ -400,6 +518,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     emitExit: boolean,
   ) {
     if (context.stopped) return;
+    for (const pending of context.pendingApprovals.values()) pending.resolve("cancel");
+    context.pendingApprovals.clear();
     const activeTurn = context.activeTurn;
     context.activeTurn = undefined;
     context.stopped = true;
@@ -468,6 +588,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         ? { model: input.modelSelection.model }
         : {}),
       onEvent,
+      onPermissionRequest: (payload: unknown) =>
+        runPromise(handlePermissionRequest(threadId, payload)),
     };
     const sdk = yield* connection
       .createSession(sdkInput)
@@ -490,6 +612,8 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       session,
       sdk,
       turns: [],
+      pendingApprovals: new Map(),
+      deniedToolCallIds: new Set(),
       activeTurn: undefined,
       stopped: false,
     });
@@ -610,7 +734,20 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     startSession,
     sendTurn,
     interruptTurn: () => unsupported("interruptTurn"),
-    respondToRequest: () => unsupported("respondToRequest"),
+    respondToRequest: (threadId, requestId, decision) =>
+      Effect.gen(function* () {
+        const context = yield* requireSession(threadId);
+        const pending = context.pendingApprovals.get(requestId);
+        if (!pending) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "respondToRequest",
+            detail: `Unknown pending approval request: ${requestId}`,
+          });
+        }
+        context.pendingApprovals.delete(requestId);
+        pending.resolve(decision);
+      }),
     respondToUserInput: () => unsupported("respondToUserInput"),
     stopSession: (threadId) =>
       requireSession(threadId).pipe(

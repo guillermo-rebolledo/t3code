@@ -29,6 +29,10 @@ there.
 For Grok, **Always allow this session** remembers the matching command or tool input. Other
 actions still ask for approval. It does not change the thread to **Full access**.
 
+Copilot follows the same four modes. Because it does not provide T3 Code's AI approval reviewer,
+**Auto** falls back to **Supervised**. A session-level Copilot approval stays scoped to the matching
+command identifiers, MCP tool, or custom tool; it does not grant unrelated operations.
+
 ## Choosing a Mode
 
 Use **Full access** for work in a worktree or a sandbox you can throw away.

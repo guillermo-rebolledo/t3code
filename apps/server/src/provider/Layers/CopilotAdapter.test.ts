@@ -1,12 +1,22 @@
 import type { SessionEvent } from "@github/copilot-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  type ProviderApprovalDecision,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ProviderRuntimeEvent,
+  type RuntimeMode,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -18,6 +28,7 @@ import type {
   CopilotSdkSessionStartInput,
 } from "../CopilotSdkRuntime.ts";
 import { CopilotSdkRuntimeError as SdkError } from "../CopilotSdkRuntime.ts";
+import type { CopilotPermission } from "../CopilotPermissions.ts";
 import { makeCopilotAdapter } from "./CopilotAdapter.ts";
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
@@ -370,6 +381,268 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
         (yield* secondAdapter.listSessions()).map((session) => session.threadId),
         [secondThread],
       );
+    }),
+  );
+
+  it.effect("honors file, shell, and generic approvals across every runtime mode", () =>
+    Effect.gen(function* () {
+      const createInputs: Array<CopilotSdkSessionStartInput> = [];
+      const runtime = runtimeWith((input) => {
+        createInputs.push(input);
+        return Effect.succeed(fakeSession(`approval-session-${createInputs.length}`));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const opened =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) =>
+        runtimeEvent.type === "request.opened" ? Queue.offer(opened, runtimeEvent) : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+
+      const write = {
+        kind: "write",
+        fileName: "src/index.ts",
+        intention: "Update source",
+        diff: "+export const ready = true",
+        canOfferSessionApproval: true,
+      } as const;
+      const shell = {
+        kind: "shell",
+        fullCommandText: "pnpm test",
+        intention: "Run tests",
+        commands: [{ identifier: "pnpm", readOnly: true }],
+        canOfferSessionApproval: true,
+      } as const;
+      const generic = {
+        kind: "custom-tool",
+        toolName: "deploy_preview",
+        toolDescription: "Deploy a preview build",
+      } as const;
+      const cases: ReadonlyArray<{
+        readonly name: string;
+        readonly mode: RuntimeMode;
+        readonly permission: CopilotPermission;
+        readonly requestType:
+          | "file_change_approval"
+          | "exec_command_approval"
+          | "dynamic_tool_call";
+        readonly decision?: ProviderApprovalDecision;
+        readonly result: unknown;
+      }> = [
+        {
+          name: "approval-file-allow",
+          mode: "approval-required",
+          permission: write,
+          requestType: "file_change_approval",
+          decision: "accept",
+          result: { kind: "approve-once", approvedInteractively: true },
+        },
+        {
+          name: "approval-shell-deny",
+          mode: "approval-required",
+          permission: shell,
+          requestType: "exec_command_approval",
+          decision: "decline",
+          result: { kind: "reject", feedback: "The user denied this request." },
+        },
+        {
+          name: "approval-generic-session",
+          mode: "approval-required",
+          permission: generic,
+          requestType: "dynamic_tool_call",
+          decision: "acceptForSession",
+          result: {
+            kind: "approve-for-session",
+            approval: { kind: "custom-tool", toolName: "deploy_preview" },
+          },
+        },
+        {
+          name: "edits-file-auto",
+          mode: "auto-accept-edits",
+          permission: write,
+          requestType: "file_change_approval",
+          result: { kind: "approve-once" },
+        },
+        {
+          name: "edits-shell-allow",
+          mode: "auto-accept-edits",
+          permission: shell,
+          requestType: "exec_command_approval",
+          decision: "accept",
+          result: { kind: "approve-once", approvedInteractively: true },
+        },
+        {
+          name: "edits-generic-deny",
+          mode: "auto-accept-edits",
+          permission: generic,
+          requestType: "dynamic_tool_call",
+          decision: "decline",
+          result: { kind: "reject", feedback: "The user denied this request." },
+        },
+        {
+          name: "auto-file-session",
+          mode: "auto",
+          permission: write,
+          requestType: "file_change_approval",
+          decision: "acceptForSession",
+          result: { kind: "approve-for-session", approval: { kind: "write" } },
+        },
+        {
+          name: "auto-shell-allow",
+          mode: "auto",
+          permission: shell,
+          requestType: "exec_command_approval",
+          decision: "accept",
+          result: { kind: "approve-once", approvedInteractively: true },
+        },
+        {
+          name: "auto-generic-deny",
+          mode: "auto",
+          permission: generic,
+          requestType: "dynamic_tool_call",
+          decision: "decline",
+          result: { kind: "reject", feedback: "The user denied this request." },
+        },
+        ...([write, shell, generic] as const).map((permission, index) => ({
+          name: `full-access-${index}`,
+          mode: "full-access" as const,
+          permission,
+          requestType: ["file_change_approval", "exec_command_approval", "dynamic_tool_call"][
+            index
+          ] as "file_change_approval" | "exec_command_approval" | "dynamic_tool_call",
+          result: { kind: "approve-once" },
+        })),
+      ];
+
+      for (const testCase of cases) {
+        const threadId = ThreadId.make(`thread-${testCase.name}`);
+        yield* adapter.startSession({
+          ...startInput(threadId, ProviderInstanceId.make("copilot")),
+          runtimeMode: testCase.mode,
+        });
+        const sdkInput = createInputs.at(-1)!;
+        if (!testCase.decision) {
+          assert.deepEqual(
+            yield* Effect.promise(() => sdkInput.onPermissionRequest(testCase.permission)),
+            testCase.result,
+            testCase.name,
+          );
+          continue;
+        }
+
+        const resultFiber = yield* Effect.promise(() =>
+          sdkInput.onPermissionRequest(testCase.permission),
+        ).pipe(Effect.forkChild);
+        const request = yield* Queue.take(opened);
+        assert.equal(request.threadId, threadId);
+        assert.equal(request.payload.requestType, testCase.requestType);
+        yield* adapter.respondToRequest(
+          threadId,
+          ApprovalRequestId.make(request.requestId!),
+          testCase.decision,
+        );
+        assert.deepEqual(yield* Fiber.join(resultFiber), testCase.result, testCase.name);
+      }
+    }),
+  );
+
+  it.effect("fails malformed requests visibly and keeps denied tools terminal", () =>
+    Effect.gen(function* () {
+      let sdkInput: CopilotSdkSessionStartInput | undefined;
+      const runtime = runtimeWith((input) => {
+        sdkInput = input;
+        return Effect.succeed(fakeSession("denied-session"));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("denied-thread");
+      const runtimeError =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "runtime.error" }>>();
+      const opened =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const started =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
+      const completed =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
+      yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) => {
+        switch (runtimeEvent.type) {
+          case "runtime.error":
+            return Deferred.succeed(runtimeError, runtimeEvent);
+          case "request.opened":
+            return Queue.offer(opened, runtimeEvent);
+          case "item.started":
+            return Queue.offer(started, runtimeEvent);
+          case "item.completed":
+            return Queue.offer(completed, runtimeEvent);
+          default:
+            return Effect.void;
+        }
+      }).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* adapter.startSession({
+        ...startInput(threadId, ProviderInstanceId.make("copilot")),
+        runtimeMode: "approval-required",
+      });
+      assert.isDefined(sdkInput);
+
+      assert.deepEqual(
+        yield* Effect.promise(() =>
+          sdkInput!.onPermissionRequest({ kind: "shell", fullCommandText: 42 }),
+        ),
+        { kind: "reject" },
+      );
+      assert.equal((yield* Deferred.await(runtimeError)).payload.class, "permission_error");
+
+      yield* adapter.sendTurn({ threadId, input: "Run a tool" });
+      sdkInput!.onEvent(
+        event({
+          type: "tool.execution_start",
+          data: { toolCallId: "tool-denied", toolName: "shell", arguments: { cmd: "rm example" } },
+        }),
+      );
+      assert.equal((yield* Queue.take(started)).itemId, "tool-denied");
+
+      const deniedResult = yield* Effect.promise(() =>
+        sdkInput!.onPermissionRequest({
+          kind: "shell",
+          fullCommandText: "rm example",
+          intention: "Remove example",
+          commands: [{ identifier: "rm", readOnly: false }],
+          canOfferSessionApproval: true,
+          toolCallId: "tool-denied",
+        }),
+      ).pipe(Effect.forkChild);
+      const approval = yield* Queue.take(opened);
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(approval.requestId!),
+        "decline",
+      );
+      assert.equal((yield* Fiber.join(deniedResult)).kind, "reject");
+      assert.equal((yield* Queue.take(completed)).payload.status, "declined");
+
+      for (let index = 0; index < 2; index += 1) {
+        sdkInput!.onEvent(
+          event({
+            type: "tool.execution_complete",
+            data: { toolCallId: "tool-denied", success: true },
+          }),
+        );
+      }
+      sdkInput!.onEvent(
+        event({
+          type: "tool.execution_start",
+          data: { toolCallId: "tool-sentinel", toolName: "preview", arguments: {} },
+        }),
+      );
+      sdkInput!.onEvent(
+        event({
+          type: "tool.execution_complete",
+          data: { toolCallId: "tool-sentinel", success: true },
+        }),
+      );
+      const sentinel = yield* Queue.take(completed);
+      assert.equal(sentinel.itemId, "tool-sentinel");
+      assert.equal(sentinel.payload.status, "completed");
     }),
   );
 

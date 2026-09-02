@@ -4,6 +4,8 @@ import {
   type GetAuthStatusResponse,
   type MessageOptions,
   type ModelInfo,
+  type PermissionRequest,
+  type PermissionRequestResult,
   type SessionConfig,
   type SessionEvent,
 } from "@github/copilot-sdk";
@@ -118,6 +120,7 @@ export interface CopilotSdkSessionStartInput {
   readonly workingDirectory: string;
   readonly model?: string;
   readonly onEvent: (event: SessionEvent) => void;
+  readonly onPermissionRequest: (request: unknown) => Promise<PermissionRequestResult>;
 }
 
 export interface CopilotSdkSession {
@@ -140,7 +143,9 @@ function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig {
   return {
     workingDirectory: input.workingDirectory,
     ...(input.model ? { model: input.model } : {}),
+    streaming: true,
     onEvent: input.onEvent,
+    onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
   };
 }
 
