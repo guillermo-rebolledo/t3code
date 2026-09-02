@@ -66,6 +66,23 @@ that observed them. Stopping an instance disconnects all of its sessions before 
 closes. Attachments are accepted only after resolving a known T3 attachment id inside the configured
 attachment store.
 
+Every Copilot turn settles through one path, so a turn emits `turn.completed` exactly once no matter
+which of interrupt, idle, runtime error, send failure, or session stop reaches it first. Native SDK
+events are tagged with the turn that was live when the runtime emitted them, so events trailing a
+settled turn are dropped instead of mutating the turn the user started next, and the aborted
+`session.idle` the runtime still owes an interrupted turn is swallowed whenever it lands. The SDK
+gives no turn correlation on its events, so a runtime that emits an item or usage event for an
+interrupted turn only after accepting the next turn's message can still attribute that one event to
+the newer turn; nothing in that class can settle a turn or leave a thread running. Interrupting
+settles the visible turn before the SDK abort is awaited, and a refused abort escalates to a session
+stop rather than leaving a runtime nobody can stop. Errors the runtime recovers from on the same
+turn - an auto-switchable rate limit, a context limit it compacts and retries - surface as
+`runtime.warning` and leave the turn running; every other `session.error` is one `runtime.error`
+that fails the turn. A `session.shutdown` settles the visible turn, disconnects the SDK session, and
+reports one `session.exited` whose exit kind reflects whether Copilot crashed. Interrupting, a
+runtime shutdown, and a session stop all release the session's open approvals, and teardown also
+releases a send the runtime never answered, so nothing outlives the work that opened it.
+
 ### Grok health check
 
 `checkGrokProviderStatus` never opens an ACP session. It runs `grok --version`, then `grok models`

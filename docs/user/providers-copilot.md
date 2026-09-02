@@ -25,5 +25,8 @@ configuration changes where Copilot stores its state, the instances share the op
 Copilot credential store.
 
 Copilot-backed threads support ordinary prompts, uploaded images and files, streaming assistant and
-reasoning output, tool progress, usage updates, and stopping. Uploaded attachments are resolved from
-T3 Code's attachment store; arbitrary server paths are never accepted as attachment identifiers.
+reasoning output, tool progress, usage updates, and stopping. Stopping a running turn takes effect
+immediately and leaves the thread ready for the next message. If Copilot reports an error or its
+process ends unexpectedly, the turn stops with that reason instead of appearing to run forever.
+Uploaded attachments are resolved from T3 Code's attachment store; arbitrary server paths are never
+accepted as attachment identifiers.
