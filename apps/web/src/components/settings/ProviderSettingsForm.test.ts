@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import { ProviderDriverKind } from "@t3tools/contracts";
+import { GithubCopilotIcon } from "../Icons";
 
-import { DRIVER_OPTION_BY_VALUE } from "./providerDriverMeta";
+import { DRIVER_OPTION_BY_VALUE, DRIVER_OPTIONS } from "./providerDriverMeta";
 import {
   deriveProviderSettingsFields,
   nextProviderConfigWithFieldValue,
@@ -10,6 +11,17 @@ import {
 } from "./ProviderSettingsForm";
 
 describe("ProviderSettingsForm helpers", () => {
+  it("offers Copilot as a configured provider with only its executable path", () => {
+    const copilot = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("copilot")];
+
+    expect(copilot).toMatchObject({ label: "GitHub Copilot", icon: GithubCopilotIcon });
+    expect(deriveProviderSettingsFields(copilot!).map((field) => field.key)).toEqual([
+      "binaryPath",
+    ]);
+    expect(DRIVER_OPTIONS.map((option) => option.value)).toContain("copilot");
+    expect(DRIVER_OPTIONS.map((option) => option.value)).not.toContain("githubCopilot");
+  });
+
   it("derives visible provider config fields from the client definition schema", () => {
     const codex = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("codex")];
 

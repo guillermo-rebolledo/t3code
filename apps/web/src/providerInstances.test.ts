@@ -21,6 +21,7 @@ function provider(input: {
   accentColor?: string;
   status?: ServerProvider["status"];
   models?: ServerProvider["models"];
+  supportsThreadExecution?: boolean;
 }): ServerProvider {
   return {
     instanceId: ProviderInstanceId.make(input.instanceId),
@@ -31,6 +32,9 @@ function provider(input: {
     installed: true,
     version: null,
     status: input.status ?? "ready",
+    ...(typeof input.supportsThreadExecution === "boolean"
+      ? { supportsThreadExecution: input.supportsThreadExecution }
+      : {}),
     ...(input.availability ? { availability: input.availability } : {}),
     auth: { status: "authenticated" },
     checkedAt: "2026-01-01T00:00:00.000Z",
@@ -68,6 +72,18 @@ describe("isProviderInstancePickerReady", () => {
     ]);
 
     expect(entry && isProviderInstancePickerReady(entry)).toBe(true);
+  });
+
+  it("rejects a discovery-only provider that cannot start threads", () => {
+    const [entry] = deriveProviderInstanceEntries([
+      provider({
+        provider: ProviderDriverKind.make("copilot"),
+        instanceId: "copilot_work",
+        supportsThreadExecution: false,
+      }),
+    ]);
+
+    expect(entry && isProviderInstancePickerReady(entry)).toBe(false);
   });
 });
 
@@ -276,6 +292,22 @@ describe("resolveSelectableProviderInstance", () => {
     ];
 
     expect(resolveSelectableProviderInstance(providers, disabled)).toBe(fallback);
+  });
+
+  it("never preserves or defaults to a discovery-only instance", () => {
+    const discoveryOnly = ProviderInstanceId.make("copilot_work");
+    const fallback = ProviderInstanceId.make("codex");
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("copilot"),
+        instanceId: discoveryOnly,
+        supportsThreadExecution: false,
+      }),
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: fallback }),
+    ];
+
+    expect(resolveSelectableProviderInstance(providers, discoveryOnly)).toBe(fallback);
+    expect(resolveSelectableProviderInstance(providers, undefined)).toBe(fallback);
   });
 
   it("prefers a ready instance over an enabled one whose driver cannot start", () => {

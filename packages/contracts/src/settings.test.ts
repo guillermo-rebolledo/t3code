@@ -6,6 +6,7 @@ import {
   ClientSettingsSchema,
   ClientSettingsPatch,
   ClaudeSettings,
+  CopilotSettings,
   DEFAULT_SERVER_SETTINGS,
   defaultEnabledForDriver,
   resolveProviderInstanceEnabled,
@@ -20,6 +21,7 @@ const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
+const decodeCopilotSettings = Schema.decodeUnknownSync(CopilotSettings);
 
 describe("ClaudeSettings auto-compaction", () => {
   it("uses Claude's default threshold when no override is configured", () => {
@@ -47,6 +49,21 @@ describe("ClaudeSettings auto-compaction", () => {
     expect(
       decodeServerSettingsPatch({ providers: { claudeAgent: { autoCompactWindow: "300000" } } }),
     ).toBeDefined();
+  });
+});
+
+describe("CopilotSettings", () => {
+  it("defaults to the installed copilot command without inventing models", () => {
+    expect(decodeCopilotSettings({})).toEqual({
+      enabled: false,
+      binaryPath: "copilot",
+    });
+  });
+
+  it("accepts and trims an explicit executable path", () => {
+    expect(decodeCopilotSettings({ binaryPath: "  /opt/homebrew/bin/copilot  " }).binaryPath).toBe(
+      "/opt/homebrew/bin/copilot",
+    );
   });
 });
 
