@@ -1658,6 +1658,48 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
     }),
   );
 
+  it.effect("invokes a skill picked as a $ mention and keeps one in prose legible", () =>
+    Effect.gen(function* () {
+      const sends: Array<string> = [];
+      const invocations: Array<{ name: string; input?: string }> = [];
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("skill-mention-session", {
+            // Copilot advertises its user-invocable skills as commands, so
+            // `deploy` reaches the adapter through the same catalog.
+            listCommands: Effect.succeed([{ name: "deploy" }]),
+            invokeCommand: (invocation) => {
+              invocations.push(invocation);
+              return Effect.succeed({ kind: "text", text: "Deployed" });
+            },
+            send: (message) =>
+              Effect.sync(() => {
+                sends.push(message.prompt);
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        ),
+      );
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("skill-mention-thread");
+      const observed = yield* observeEvents(adapter);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      yield* adapter.sendTurn({ threadId, input: "$deploy staging" });
+      yield* observed.until((runtimeEvent) => runtimeEvent.type === "turn.completed");
+      yield* adapter.sendTurn({ threadId, input: "please $deploy staging, then $HOME" });
+      yield* observed.until(
+        (runtimeEvent) => runtimeEvent.type === "turn.completed" && sends.length > 0,
+      );
+
+      assert.deepEqual(invocations, [{ name: "deploy", input: "staging" }]);
+      // The mention Copilot advertised becomes command text it can act on; an
+      // unadvertised `$HOME` stays exactly what the user wrote.
+      assert.deepEqual(sends, ["please /deploy staging, then $HOME"]);
+    }),
+  );
+
   it.effect("fails the turn once when the command RPC rejects", () =>
     Effect.gen(function* () {
       const runtime = runtimeWith(() =>

@@ -30,11 +30,22 @@ type ContextTier = NonNullable<SessionConfigBase["contextTier"]>;
 
 const DEFAULT_START_TIMEOUT_MS = 8_000;
 /**
- * Copilot's own commands and its user-invocable skills, but not commands an
- * SDK client registered: T3 registers none, and a command it cannot run has no
- * business in the composer.
+ * Commands an SDK client registered are never listed: T3 registers none, and a
+ * command it cannot run has no business in the composer.
+ *
+ * The two reads differ on skills on purpose. Copilot repeats every
+ * user-invocable skill as a command, so publishing them would send the skill
+ * inventory twice in one snapshot - measured at 142 commands against 32 - for
+ * rows the client already drops in favour of the skill entry. Routing still
+ * needs them: `/deploy`, and the `$deploy` the composer rewrites into it, are
+ * only invocable if the live session knows the name.
  */
-const COMMAND_LIST_FILTERS = {
+const PUBLISHED_COMMAND_FILTERS = {
+  includeBuiltins: true,
+  includeSkills: false,
+  includeClientCommands: false,
+} as const;
+const ROUTABLE_COMMAND_FILTERS = {
   includeBuiltins: true,
   includeSkills: true,
   includeClientCommands: false,
@@ -228,7 +239,7 @@ function wrapSession(
     setModel: (options) =>
       sdkEffect("setModel", () => session.setModel(options.model, modelSettings(options))),
     listCommands: sdkEffect("listCommands", () =>
-      session.rpc.commands.list(COMMAND_LIST_FILTERS),
+      session.rpc.commands.list(ROUTABLE_COMMAND_FILTERS),
     ).pipe(Effect.map((result) => result.commands)),
     invokeCommand: (input) =>
       sdkEffect("invokeCommand", () => session.rpc.commands.invoke({ ...input })),
@@ -352,7 +363,7 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
             onPermissionRequest: () => Promise.resolve({ kind: "reject" as const }),
           });
           try {
-            const result = await session.rpc.commands.list(COMMAND_LIST_FILTERS);
+            const result = await session.rpc.commands.list(PUBLISHED_COMMAND_FILTERS);
             return result.commands;
           } finally {
             await session.disconnect().catch(() => undefined);

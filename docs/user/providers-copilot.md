@@ -49,6 +49,12 @@ prompt, so a message can still begin with a path or a fraction. A few commands a
 T3 Code already owns them: use the model picker and the thread's mode instead of Copilot's `/model`,
 `/plan`, and `/default`.
 
+Picking a skill inserts it as a `$name` chip, the same as every other provider. T3 Code hands that
+to Copilot in the form Copilot understands, so a message that is just the skill runs it directly,
+and a skill named in the middle of a sentence reaches Copilot as part of the request. A `$` that
+names nothing Copilot offers is left exactly as you typed it, so `$HOME` in a sentence stays
+`$HOME`.
+
 Commands and skills belong to the directory they were found in. Another project sees its own, and a
 project that Copilot cannot answer for keeps working as an ordinary conversation - you lose the
 command list for that directory, not the ability to talk to Copilot.

@@ -92,6 +92,15 @@ instance-wide snapshot advertises no commands or skills at all. Malformed skill 
 individually, and a source T3 does not recognise is published without a scope rather than under a
 guessed one.
 
+The composer writes a skill pick as `$name`, which Copilot does not read. `rewriteCopilotSkillMentions`
+turns every mention naming an advertised command into `/name` before routing, so a lone pick invokes
+the skill through the command RPC and a mention inside prose reaches the agent as command text it can
+act on itself; a mention Copilot never advertised is left verbatim. The two command reads differ on
+skills deliberately: the published catalog omits them, because Copilot repeats every user-invocable
+skill as a command and the client already drops those rows in favour of the skill entry (142 commands
+against 32 on one real inventory), while the live session's routing set includes them so those names
+stay invocable.
+
 A turn whose prompt names a command the session advertised is invoked through `commands.invoke`;
 everything else, including slash text naming a command Copilot did not advertise, goes out through
 `send` unchanged. Commands T3 Code owns through its own interface - `model`, `plan`, `default` -

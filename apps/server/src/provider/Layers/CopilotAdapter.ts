@@ -39,6 +39,7 @@ import {
   mapCopilotSlashCommands,
   parseCopilotSlashCommand,
   resolveCopilotCommandOutcome,
+  rewriteCopilotSkillMentions,
 } from "../CopilotCommands.ts";
 import { buildCopilotContinuation, resolveCopilotContinuation } from "../CopilotContinuation.ts";
 import { resolveCopilotModelOptions } from "../CopilotSdkModels.ts";
@@ -1078,10 +1079,13 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         : mapSdkError(method, failure);
     });
 
+    // The composer writes a skill pick as `$name`, which Copilot does not read.
+    // Rewriting it to `/name` first is what makes a pick routable here and
+    // legible to the agent anywhere else in the prompt.
+    let prompt = rewriteCopilotSkillMentions(input.input?.trim() ?? "", context.commandNames);
     // Only a command Copilot advertised for this session is routed to its
     // command RPC. Unknown slash text is prose and goes out as written.
-    const command = parseCopilotSlashCommand(input.input?.trim() ?? "", context.commandNames);
-    let prompt = input.input?.trim() ?? "";
+    const command = parseCopilotSlashCommand(prompt, context.commandNames);
     if (command) {
       const invocation = yield* untilTerminated(context.sdk.invokeCommand(command), {
         method: "commands.invoke",

@@ -5,6 +5,7 @@ import {
   mapCopilotSlashCommands,
   parseCopilotSlashCommand,
   resolveCopilotCommandOutcome,
+  rewriteCopilotSkillMentions,
 } from "./CopilotCommands.ts";
 
 describe("mapCopilotSlashCommands", () => {
@@ -95,5 +96,35 @@ describe("resolveCopilotCommandOutcome", () => {
         options: [{ name: "add", description: "Add a server" }, { name: "list" }],
       }),
     ).toEqual({ kind: "text", text: "Pick one\n- add: Add a server\n- list" });
+  });
+});
+
+describe("rewriteCopilotSkillMentions", () => {
+  const names = copilotSlashCommandNames([{ name: "deploy" }, { name: "code-review" }]);
+
+  it("turns a lone mention into the command form Copilot routes", () => {
+    expect(rewriteCopilotSkillMentions("$deploy", names)).toBe("/deploy");
+    expect(rewriteCopilotSkillMentions("$deploy staging", names)).toBe("/deploy staging");
+  });
+
+  it("rewrites a mention inside a sentence so the agent can act on it", () => {
+    expect(rewriteCopilotSkillMentions("please $deploy staging", names)).toBe(
+      "please /deploy staging",
+    );
+    expect(rewriteCopilotSkillMentions("run $deploy then $code-review", names)).toBe(
+      "run /deploy then /code-review",
+    );
+  });
+
+  it("leaves text alone when the mention names nothing Copilot advertised", () => {
+    expect(rewriteCopilotSkillMentions("echo $HOME and $PATH", names)).toBe("echo $HOME and $PATH");
+    expect(rewriteCopilotSkillMentions("cost is $deployment", names)).toBe("cost is $deployment");
+    expect(rewriteCopilotSkillMentions("price$deploy", names)).toBe("price$deploy");
+    expect(rewriteCopilotSkillMentions("no mentions here", names)).toBe("no mentions here");
+  });
+
+  it("hands a rewritten lone mention to the command parser", () => {
+    expect(parseCopilotSlashCommand(rewriteCopilotSkillMentions("$deploy prod", names), names)) //
+      .toEqual({ name: "deploy", input: "prod" });
   });
 });

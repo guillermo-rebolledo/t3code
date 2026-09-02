@@ -102,6 +102,30 @@ export function parseCopilotSlashCommand(
 }
 
 /**
+ * Same token shape the composer inserts and the timeline chips render
+ * (`packages/shared/src/composerInlineTokens.ts`), widened to end-of-string so
+ * a prompt that is nothing but one mention still matches.
+ */
+const SKILL_MENTION_PATTERN = /(^|\s)\$([a-zA-Z][a-zA-Z0-9:_-]*)(?=\s|$)/gu;
+
+/**
+ * Rewrite the composer's `$skill` mentions into the `/skill` form Copilot
+ * understands. Copilot advertises its user-invocable skills as commands, so a
+ * prompt that is just one mention goes on to route through the command RPC,
+ * and a mention inside a sentence reaches the agent as legible command text it
+ * can act on itself. A mention Copilot did not advertise is left alone: `$HOME`
+ * in prose must stay `$HOME`.
+ */
+export function rewriteCopilotSkillMentions(
+  prompt: string,
+  commandNames: ReadonlySet<string>,
+): string {
+  return prompt.replace(SKILL_MENTION_PATTERN, (match, prefix: string, name: string) =>
+    commandNames.has(name.toLowerCase()) ? `${prefix}/${name}` : match,
+  );
+}
+
+/**
  * Reduce an invocation result to the two shapes a turn can take. A
  * subcommand selection is rendered as text: T3 has no picker for it, and
  * showing the options lets the user name one on the next message. The mode a
