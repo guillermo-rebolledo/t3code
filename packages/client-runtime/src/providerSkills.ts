@@ -83,6 +83,8 @@ export function resolveProviderSkillSourceKind(
 
   const normalizedScope = skill.scope?.trim().toLowerCase();
   switch (normalizedScope) {
+    case "app":
+      return "app";
     case "repo":
     case "repository":
       return "repo";

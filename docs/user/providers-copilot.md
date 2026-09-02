@@ -41,6 +41,24 @@ thread. Files come back through T3 Code's own checkpoints, so a restore never de
 file history. If Copilot is busy or refuses the rewind, the thread stays exactly as it was and tells
 you why.
 
+Copilot's own slash commands appear in the composer for the project or worktree you are working
+in, alongside the skills Copilot finds there. Picking one, or typing it yourself, runs it as a
+Copilot command rather than sending it as text, and its output lands in the thread like any other
+reply. Text that merely starts with a slash Copilot does not recognize is sent as an ordinary
+prompt, so a message can still begin with a path or a fraction. A few commands are left out because
+T3 Code already owns them: use the model picker and the thread's mode instead of Copilot's `/model`,
+`/plan`, and `/default`.
+
+Picking a skill inserts it as a `$name` chip, the same as every other provider. T3 Code hands that
+to Copilot in the form Copilot understands, so a message that is just the skill runs it directly,
+and a skill named in the middle of a sentence reaches Copilot as part of the request. A `$` that
+names nothing Copilot offers is left exactly as you typed it, so `$HOME` in a sentence stays
+`$HOME`.
+
+Commands and skills belong to the directory they were found in. Another project sees its own, and a
+project that Copilot cannot answer for keeps working as an ordinary conversation - you lose the
+command list for that directory, not the ability to talk to Copilot.
+
 Changing the model or a model option, such as reasoning effort or context window, applies to the
 running Copilot session and takes effect on your next message; the conversation is not restarted. A
 model your account cannot use, or an option a model does not offer, is reported instead of quietly

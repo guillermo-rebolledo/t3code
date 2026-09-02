@@ -17,7 +17,9 @@ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
+import type { CopilotSdkConnection } from "../CopilotSdkRuntime.ts";
 import { CopilotSdkRuntime } from "../CopilotSdkRuntime.ts";
+import { discoverCopilotWorkspaceCapabilities } from "../CopilotWorkspace.ts";
 import { ProviderAdapterRequestError, ProviderDriverError } from "../Errors.ts";
 import {
   buildInitialCopilotProviderSnapshot,
@@ -130,7 +132,10 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies CopilotSettings;
-      const adapter = enabled
+      // The instance's one SDK connection serves both its adapter and its
+      // per-workspace command and skill reads, so discovery never starts a
+      // second Copilot process behind the running one.
+      const connection: CopilotSdkConnection | undefined = enabled
         ? yield* runtime
             .connect({
               binaryPath: effectiveConfig.binaryPath,
@@ -147,13 +152,13 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
                     cause,
                   }),
               ),
-              Effect.flatMap((connection) =>
-                makeCopilotAdapter(connection, {
-                  instanceId,
-                  ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
-                }),
-              ),
             )
+        : undefined;
+      const adapter = connection
+        ? yield* makeCopilotAdapter(connection, {
+            instanceId,
+            ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+          })
         : discoveryOnlyAdapter();
       const lastModels = yield* Ref.make<ReadonlyArray<ServerProviderModel>>([]);
       const checkProvider = checkCopilotProviderStatus(effectiveConfig, processEnv, {
@@ -184,6 +189,22 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         ),
       );
 
+      // Workspace capabilities stay out of the instance-wide snapshot: they
+      // describe one directory, and the registry keys them by `cwd`.
+      const snapshotForCwd = (cwd: string) =>
+        connection
+          ? Effect.all([
+              snapshot.getSnapshot,
+              discoverCopilotWorkspaceCapabilities(connection, cwd),
+            ]).pipe(
+              Effect.map(([machineSnapshot, capabilities]) => ({
+                ...machineSnapshot,
+                slashCommands: capabilities.slashCommands,
+                skills: capabilities.skills,
+              })),
+            )
+          : snapshot.getSnapshot;
+
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -192,6 +213,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         accentColor,
         enabled,
         snapshot,
+        snapshotForCwd,
         adapter,
         textGeneration: discoveryOnlyTextGeneration(),
       } satisfies ProviderInstance;
