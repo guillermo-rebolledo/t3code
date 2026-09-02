@@ -1,12 +1,13 @@
 import {
   CopilotClient,
   RuntimeConnection,
+  type GetAuthStatusResponse,
   type MessageOptions,
+  type ModelInfo,
   type PermissionRequest,
   type PermissionRequestResult,
+  type SessionConfig,
   type SessionEvent,
-  type GetAuthStatusResponse,
-  type ModelInfo,
 } from "@github/copilot-sdk";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -111,11 +112,11 @@ export interface CopilotSdkConnection {
   readonly authStatus: Effect.Effect<GetAuthStatusResponse, CopilotSdkRuntimeError>;
   readonly models: Effect.Effect<ReadonlyArray<ModelInfo>, CopilotSdkRuntimeError>;
   readonly createSession: (
-    input: CopilotSdkSessionInput,
+    input: CopilotSdkSessionStartInput,
   ) => Effect.Effect<CopilotSdkSession, CopilotSdkRuntimeError>;
 }
 
-export interface CopilotSdkSessionInput {
+export interface CopilotSdkSessionStartInput {
   readonly workingDirectory: string;
   readonly model?: string;
   readonly onEvent: (event: SessionEvent) => void;
@@ -125,18 +126,26 @@ export interface CopilotSdkSessionInput {
 export interface CopilotSdkSession {
   readonly sessionId: string;
   readonly send: (input: MessageOptions) => Effect.Effect<string, CopilotSdkRuntimeError>;
-  readonly abort: Effect.Effect<void, CopilotSdkRuntimeError>;
   readonly disconnect: Effect.Effect<void, CopilotSdkRuntimeError>;
 }
 
-function makeSession(
+function wrapSession(
   session: Awaited<ReturnType<CopilotClient["createSession"]>>,
 ): CopilotSdkSession {
   return {
     sessionId: session.sessionId,
-    send: (input) => sdkEffect("session.send", () => session.send(input)),
-    abort: sdkEffect("session.abort", () => session.abort()),
-    disconnect: sdkEffect("session.disconnect", () => session.disconnect()),
+    send: (input) => sdkEffect("send", () => session.send(input)),
+    disconnect: sdkEffect("disconnect", () => session.disconnect()),
+  };
+}
+
+function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig {
+  return {
+    workingDirectory: input.workingDirectory,
+    ...(input.model ? { model: input.model } : {}),
+    streaming: true,
+    onEvent: input.onEvent,
+    onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
   };
 }
 
@@ -197,15 +206,9 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
       authStatus: sdkEffect("getAuthStatus", () => client.getAuthStatus()),
       models: sdkEffect("listModels", () => client.listModels()),
       createSession: (input) =>
-        sdkEffect("createSession", () =>
-          client.createSession({
-            workingDirectory: input.workingDirectory,
-            ...(input.model ? { model: input.model } : {}),
-            streaming: true,
-            onEvent: input.onEvent,
-            onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
-          }),
-        ).pipe(Effect.map(makeSession)),
+        sdkEffect("createSession", () => client.createSession(sessionConfig(input))).pipe(
+          Effect.map(wrapSession),
+        ),
     };
   }),
 };

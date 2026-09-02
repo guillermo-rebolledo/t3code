@@ -1,642 +1,783 @@
+import type { MessageOptions, SessionEvent } from "@github/copilot-sdk";
 import {
   ApprovalRequestId,
   EventId,
   type ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderItemId,
   type ProviderRuntimeEvent,
+  type ProviderSendTurnInput,
   type ProviderSession,
-  type ProviderUserInputAnswers,
+  type ProviderSessionStartInput,
   RuntimeItemId,
   RuntimeRequestId,
   type ThreadId,
-  type ToolLifecycleItemType,
   TurnId,
 } from "@t3tools/contracts";
-import type { SessionEvent } from "@github/copilot-sdk";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
-import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import * as SynchronizedRef from "effect/SynchronizedRef";
 
-import {
-  ProviderAdapterRequestError,
-  ProviderAdapterSessionNotFoundError,
-  ProviderAdapterValidationError,
-} from "../Errors.ts";
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { ServerConfig } from "../../config.ts";
 import type {
   CopilotSdkConnection,
   CopilotSdkRuntimeError,
   CopilotSdkSession,
 } from "../CopilotSdkRuntime.ts";
 import {
+  ProviderAdapterRequestError,
+  ProviderAdapterSessionNotFoundError,
+  ProviderAdapterValidationError,
+} from "../Errors.ts";
+import {
   approvalDecisionResult,
   approvalOptionsForPermission,
   automaticPermissionResult,
   canonicalPermissionRequest,
-  type CopilotPermission,
   parseCopilotPermission,
 } from "../CopilotPermissions.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("copilot");
 
-interface SessionContext {
-  readonly sdk: CopilotSdkSession;
-  session: ProviderSession;
-  readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
-  readonly turns: Array<{ readonly id: TurnId; readonly items: ReadonlyArray<unknown> }>;
-  readonly toolItemTypes: Map<string, ToolLifecycleItemType>;
-  readonly deniedToolCallIds: Set<string>;
-  activeTurn:
-    | {
-        readonly id: TurnId;
-        readonly resolve: (outcome: TurnOutcome) => void;
-      }
-    | undefined;
+export interface CopilotAdapterOptions {
+  readonly instanceId?: ProviderInstanceId;
+  readonly nativeEventLogger?: EventNdjsonLogger;
 }
 
-interface TurnOutcome {
-  readonly state: "completed" | "cancelled" | "failed";
-  readonly errorMessage?: string;
+interface CopilotTurnState {
+  readonly id: TurnId;
+  readonly items: Array<unknown>;
+  readonly startedItems: Set<string>;
+  readonly streamedItems: Set<string>;
+  usage: unknown | undefined;
+}
+
+interface CopilotSessionContext {
+  session: ProviderSession;
+  readonly sdk: CopilotSdkSession;
+  readonly turns: Array<CopilotTurnState>;
+  readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
+  readonly deniedToolCallIds: Set<string>;
+  activeTurn: CopilotTurnState | undefined;
+  stopped: boolean;
 }
 
 interface PendingApproval {
-  readonly permission: CopilotPermission;
   readonly resolve: (decision: ProviderApprovalDecision) => void;
 }
 
-type CopilotAdapterError =
-  | ProviderAdapterRequestError
-  | ProviderAdapterSessionNotFoundError
-  | ProviderAdapterValidationError;
+function errorDetail(error: unknown): string {
+  return error instanceof Error && error.message.trim() ? error.message.trim() : String(error);
+}
 
-export function makeCopilotAdapter(
-  connectionSource:
-    | CopilotSdkConnection
-    | (() => Effect.Effect<CopilotSdkConnection, CopilotSdkRuntimeError, Scope.Scope>),
-  options?: { readonly instanceId?: ProviderInstanceId },
-) {
-  return Effect.gen(function* () {
-    const adapterScope = yield* Effect.scope;
-    const instanceId = options?.instanceId ?? ProviderInstanceId.make("copilot");
-    const sessions = new Map<ThreadId, SessionContext>();
-    const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
-    let eventSequence = 0;
-    let turnSequence = 0;
-    const connectionRef = yield* SynchronizedRef.make<CopilotSdkConnection | undefined>(
-      typeof connectionSource === "function" ? undefined : connectionSource,
-    );
-
-    const getConnection = SynchronizedRef.modifyEffect(connectionRef, (current) => {
-      if (current) return Effect.succeed([current, current] as const);
-      if (typeof connectionSource !== "function") {
-        return Effect.succeed([connectionSource, connectionSource] as const);
-      }
-      return connectionSource().pipe(
-        Effect.provideService(Scope.Scope, adapterScope),
-        Effect.map((connection) => [connection, connection] as const),
-      );
-    });
-
-    const stamp = () => ({
-      eventId: EventId.make(`copilot:${instanceId}:event:${++eventSequence}`),
-      createdAt: DateTime.formatIso(DateTime.nowUnsafe()),
-    });
-
-    const toolItemType = (event: Extract<SessionEvent, { type: "tool.execution_start" }>) => {
-      if (event.data.mcpServerName) return "mcp_tool_call" as const;
-      const name = event.data.toolName.toLowerCase();
-      if (/(bash|shell|exec|terminal|command)/u.test(name)) return "command_execution" as const;
-      if (/(write|edit|patch|delete|move|rename)/u.test(name)) return "file_change" as const;
-      return "dynamic_tool_call" as const;
-    };
-
-    const requireSession = (
-      threadId: ThreadId,
-    ): Effect.Effect<SessionContext, ProviderAdapterSessionNotFoundError> => {
-      const context = sessions.get(threadId);
-      return context
-        ? Effect.succeed(context)
-        : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }));
-    };
-
-    const cancelPending = (context: SessionContext) => {
-      for (const pending of context.pendingApprovals.values()) pending.resolve("cancel");
-      context.pendingApprovals.clear();
-      context.activeTurn?.resolve({ state: "cancelled" });
-    };
-
-    const disconnectContext = (context: SessionContext) =>
-      Effect.sync(() => cancelPending(context)).pipe(
-        Effect.andThen(context.sdk.disconnect),
-        Effect.ignore,
-      );
-
-    const startSession: ProviderAdapterShape<CopilotAdapterError>["startSession"] = (input) =>
-      Effect.gen(function* () {
-        if (!input.cwd?.trim()) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "startSession",
-            issue: "cwd is required and must be non-empty.",
-          });
-        }
-        if (input.provider !== undefined && input.provider !== PROVIDER) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "startSession",
-            issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
-          });
-        }
-
-        const existing = sessions.get(input.threadId);
-        if (existing) {
-          yield* disconnectContext(existing);
-          sessions.delete(input.threadId);
-        }
-
-        const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
-        let context: SessionContext | undefined;
-        let approvalSequence = 0;
-        const onEvent = (event: SessionEvent) => {
-          if (!context) return;
-          const base = {
-            ...stamp(),
-            provider: PROVIDER,
-            providerInstanceId: instanceId,
-            threadId: input.threadId,
-            turnId: context.activeTurn?.id,
-          };
-          switch (event.type) {
-            case "assistant.message_start":
-              Queue.offerUnsafe(events, {
-                type: "item.started",
-                ...base,
-                itemId: RuntimeItemId.make(event.data.messageId),
-                payload: { itemType: "assistant_message", status: "inProgress" },
-              });
-              return;
-            case "assistant.message_delta":
-              if (event.data.deltaContent) {
-                Queue.offerUnsafe(events, {
-                  type: "content.delta",
-                  ...base,
-                  itemId: RuntimeItemId.make(event.data.messageId),
-                  payload: { streamKind: "assistant_text", delta: event.data.deltaContent },
-                  raw: {
-                    source: "copilot.sdk.event",
-                    method: event.type,
-                    payload: event.data,
-                  },
-                });
-              }
-              return;
-            case "assistant.message":
-              Queue.offerUnsafe(events, {
-                type: "item.completed",
-                ...base,
-                itemId: RuntimeItemId.make(event.data.messageId),
-                payload: { itemType: "assistant_message", status: "completed" },
-              });
-              return;
-            case "assistant.reasoning_delta":
-              if (event.data.deltaContent) {
-                Queue.offerUnsafe(events, {
-                  type: "content.delta",
-                  ...base,
-                  itemId: RuntimeItemId.make(event.data.reasoningId),
-                  payload: { streamKind: "reasoning_text", delta: event.data.deltaContent },
-                  raw: {
-                    source: "copilot.sdk.event",
-                    method: event.type,
-                    payload: event.data,
-                  },
-                });
-              }
-              return;
-            case "tool.execution_start": {
-              if (context.deniedToolCallIds.has(event.data.toolCallId)) return;
-              const itemType = toolItemType(event);
-              context.toolItemTypes.set(event.data.toolCallId, itemType);
-              Queue.offerUnsafe(events, {
-                type: "item.started",
-                ...base,
-                itemId: RuntimeItemId.make(event.data.toolCallId),
-                payload: {
-                  itemType,
-                  status: "inProgress",
-                  title: event.data.mcpToolName?.trim() || event.data.toolName,
-                  data: event.data.arguments,
-                },
-                raw: {
-                  source: "copilot.sdk.event",
-                  method: event.type,
-                  payload: event.data,
-                },
-              });
-              return;
-            }
-            case "tool.execution_progress":
-              if (!context.deniedToolCallIds.has(event.data.toolCallId)) {
-                Queue.offerUnsafe(events, {
-                  type: "item.updated",
-                  ...base,
-                  itemId: RuntimeItemId.make(event.data.toolCallId),
-                  payload: {
-                    itemType:
-                      context.toolItemTypes.get(event.data.toolCallId) ?? "dynamic_tool_call",
-                    status: "inProgress",
-                    detail: event.data.progressMessage,
-                  },
-                });
-              }
-              return;
-            case "tool.execution_complete": {
-              if (context.deniedToolCallIds.has(event.data.toolCallId)) return;
-              const itemType =
-                context.toolItemTypes.get(event.data.toolCallId) ?? "dynamic_tool_call";
-              context.toolItemTypes.delete(event.data.toolCallId);
-              Queue.offerUnsafe(events, {
-                type: "item.completed",
-                ...base,
-                itemId: RuntimeItemId.make(event.data.toolCallId),
-                payload: {
-                  itemType,
-                  status: event.data.success ? "completed" : "failed",
-                  ...(event.data.error?.message ? { detail: event.data.error.message } : {}),
-                },
-                raw: {
-                  source: "copilot.sdk.event",
-                  method: event.type,
-                  payload: event.data,
-                },
-              });
-              return;
-            }
-            case "session.idle":
-              context.activeTurn?.resolve({
-                state: event.data?.aborted === true ? "cancelled" : "completed",
-              });
-              return;
-            case "session.error": {
-              if (event.agentId !== undefined) return;
-              const message = event.data.message?.trim() || "GitHub Copilot session error.";
-              Queue.offerUnsafe(events, {
-                type: "runtime.error",
-                ...base,
-                payload: { message, class: "provider_error", detail: event.data },
-                raw: { source: "copilot.sdk.event", method: event.type, payload: event.data },
-              });
-              context.activeTurn?.resolve({ state: "failed", errorMessage: message });
-              return;
-            }
-            default:
-              return;
-          }
-        };
-        const onPermissionRequest = async (payload: unknown) => {
-          const permission = parseCopilotPermission(payload);
-          if (!permission) {
-            Queue.offerUnsafe(events, {
-              type: "runtime.error",
-              ...stamp(),
-              provider: PROVIDER,
-              providerInstanceId: instanceId,
-              threadId: input.threadId,
-              payload: {
-                message: "Copilot sent an unknown or malformed permission request.",
-                class: "permission_error",
-                detail: payload,
-              },
-              raw: {
-                source: "copilot.sdk.permission",
-                method: "permission.malformed",
-                payload,
-              },
-            });
-            return { kind: "reject" } as const;
-          }
-
-          const automatic = automaticPermissionResult(input.runtimeMode, permission);
-          if (automatic) return automatic;
-
-          approvalSequence += 1;
-          const requestId = ApprovalRequestId.make(
-            `copilot:${instanceId}:${input.threadId}:${approvalSequence}`,
-          );
-          const canonical = canonicalPermissionRequest(permission);
-          Queue.offerUnsafe(events, {
-            type: "request.opened",
-            ...stamp(),
-            provider: PROVIDER,
-            providerInstanceId: instanceId,
-            threadId: input.threadId,
-            turnId: context?.session.activeTurnId,
-            requestId: RuntimeRequestId.make(requestId),
-            payload: {
-              requestType: canonical.requestType,
-              detail: canonical.detail,
-              ...(canonical.appName ? { appName: canonical.appName } : {}),
-              options: [...approvalOptionsForPermission(permission)],
-              args: permission,
-            },
-            raw: {
-              source: "copilot.sdk.permission",
-              method: "permission.requested",
-              payload,
-            },
-          });
-
-          const decision = await new Promise<ProviderApprovalDecision>((resolve) => {
-            pendingApprovals.set(requestId, { permission, resolve });
-          });
-          pendingApprovals.delete(requestId);
-          Queue.offerUnsafe(events, {
-            type: "request.resolved",
-            ...stamp(),
-            provider: PROVIDER,
-            providerInstanceId: instanceId,
-            threadId: input.threadId,
-            turnId: context?.session.activeTurnId,
-            requestId: RuntimeRequestId.make(requestId),
-            payload: {
-              requestType: canonical.requestType,
-              decision,
-              resolution: approvalDecisionResult(decision, permission),
-            },
-            raw: {
-              source: "copilot.sdk.permission",
-              method: "permission.completed",
-              payload: { request: payload, decision },
-            },
-          });
-          const result = approvalDecisionResult(decision, permission);
-          if (result.kind === "reject" && permission.toolCallId && context) {
-            context.deniedToolCallIds.add(permission.toolCallId);
-            const itemType = context.toolItemTypes.get(permission.toolCallId);
-            if (itemType) {
-              context.toolItemTypes.delete(permission.toolCallId);
-              Queue.offerUnsafe(events, {
-                type: "item.completed",
-                ...stamp(),
-                provider: PROVIDER,
-                providerInstanceId: instanceId,
-                threadId: input.threadId,
-                turnId: context.activeTurn?.id,
-                itemId: RuntimeItemId.make(permission.toolCallId),
-                payload: {
-                  itemType,
-                  status: "declined",
-                  detail: "The user denied this tool request.",
-                },
-              });
-            }
-          }
-          return result;
-        };
-
-        const connection = yield* getConnection.pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "runtime/connect",
-                detail: "Failed to connect to the Copilot SDK runtime.",
-                cause,
-              }),
-          ),
-        );
-        const sdk = yield* connection
-          .createSession({
-            workingDirectory: input.cwd,
-            ...(input.modelSelection?.instanceId === instanceId
-              ? { model: input.modelSelection.model }
-              : {}),
-            onEvent,
-            onPermissionRequest,
-          })
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "session/create",
-                  detail: "Failed to create the Copilot session.",
-                  cause,
-                }),
-            ),
-          );
-        const now = DateTime.formatIso(yield* DateTime.now);
-        const session: ProviderSession = {
-          provider: PROVIDER,
-          providerInstanceId: instanceId,
-          threadId: input.threadId,
-          runtimeMode: input.runtimeMode,
-          cwd: input.cwd,
-          status: "ready",
-          resumeCursor: { sessionId: sdk.sessionId },
-          createdAt: now,
-          updatedAt: now,
-        };
-        context = {
-          sdk,
-          session,
-          pendingApprovals,
-          turns: [],
-          toolItemTypes: new Map(),
-          deniedToolCallIds: new Set(),
-          activeTurn: undefined,
-        };
-        sessions.set(input.threadId, context);
-        Queue.offerUnsafe(events, {
-          type: "session.started",
-          ...stamp(),
-          provider: PROVIDER,
-          providerInstanceId: instanceId,
-          threadId: input.threadId,
-          payload: { resume: { sessionId: sdk.sessionId } },
-        });
-        Queue.offerUnsafe(events, {
-          type: "session.state.changed",
-          ...stamp(),
-          provider: PROVIDER,
-          providerInstanceId: instanceId,
-          threadId: input.threadId,
-          payload: { state: "ready", reason: "GitHub Copilot SDK session ready" },
-        });
-        Queue.offerUnsafe(events, {
-          type: "thread.started",
-          ...stamp(),
-          provider: PROVIDER,
-          providerInstanceId: instanceId,
-          threadId: input.threadId,
-          payload: { providerThreadId: sdk.sessionId },
-        });
-        return session;
-      });
-
-    const unsupported = (method: string) =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method,
-          detail: "This Copilot operation is not supported yet.",
-        }),
-      );
-
-    yield* Effect.addFinalizer(() =>
-      Effect.forEach(sessions.values(), disconnectContext, { discard: true }).pipe(
-        Effect.tap(() => Effect.sync(() => sessions.clear())),
-        Effect.tap(() => Queue.shutdown(events)),
-      ),
-    );
-
-    return {
-      provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "unsupported" },
-      startSession,
-      sendTurn: (input) =>
-        Effect.gen(function* () {
-          const context = yield* requireSession(input.threadId);
-          if (context.activeTurn) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "sendTurn",
-              issue: "A turn is already in progress for this thread.",
-            });
-          }
-          const prompt = input.input?.trim();
-          if (!prompt) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "sendTurn",
-              issue: "Copilot turns currently require non-empty text.",
-            });
-          }
-          const turnId = TurnId.make(
-            `copilot:${instanceId}:${input.threadId}:turn:${++turnSequence}`,
-          );
-          let settle!: (outcome: TurnOutcome) => void;
-          const completion = new Promise<TurnOutcome>((resolve) => {
-            settle = resolve;
-          });
-          context.activeTurn = { id: turnId, resolve: settle };
-          context.session = { ...context.session, status: "running", activeTurnId: turnId };
-          Queue.offerUnsafe(events, {
-            type: "turn.started",
-            ...stamp(),
-            provider: PROVIDER,
-            providerInstanceId: instanceId,
-            threadId: input.threadId,
-            turnId,
-            payload: { model: context.session.model },
-          });
-          const outcome = yield* context.sdk
-            .send({
-              prompt,
-              agentMode: input.interactionMode === "plan" ? "plan" : "interactive",
-            })
-            .pipe(
-              Effect.flatMap(() => Effect.promise(() => completion)),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/send",
-                    detail: "Failed to send the Copilot turn.",
-                    cause,
-                  }),
-              ),
-              Effect.ensuring(
-                Effect.sync(() => {
-                  context.activeTurn = undefined;
-                  context.session = {
-                    ...context.session,
-                    status: "ready",
-                    activeTurnId: undefined,
-                    updatedAt: DateTime.formatIso(DateTime.nowUnsafe()),
-                  };
-                }),
-              ),
-            );
-          context.turns.push({ id: turnId, items: [{ prompt }] });
-          Queue.offerUnsafe(events, {
-            type: "turn.completed",
-            ...stamp(),
-            provider: PROVIDER,
-            providerInstanceId: instanceId,
-            threadId: input.threadId,
-            turnId,
-            payload: {
-              state: outcome.state,
-              stopReason:
-                outcome.state === "completed"
-                  ? null
-                  : outcome.state === "cancelled"
-                    ? "cancelled"
-                    : "error",
-              ...(outcome.errorMessage ? { errorMessage: outcome.errorMessage } : {}),
-            },
-          });
-          return { threadId: input.threadId, turnId, resumeCursor: context.session.resumeCursor };
-        }),
-      interruptTurn: (threadId) =>
-        Effect.gen(function* () {
-          const context = yield* requireSession(threadId);
-          cancelPending(context);
-          yield* context.sdk.abort.pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "session/abort",
-                  detail: "Failed to interrupt the Copilot turn.",
-                  cause,
-                }),
-            ),
-          );
-          context.activeTurn?.resolve({ state: "cancelled" });
-        }),
-      respondToRequest: (threadId, requestId, decision) =>
-        Effect.gen(function* () {
-          const context = yield* requireSession(threadId);
-          const pending = context.pendingApprovals.get(requestId);
-          if (!pending) {
-            return yield* new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "session/request_permission",
-              detail: `Unknown pending approval request: ${requestId}`,
-            });
-          }
-          context.pendingApprovals.delete(requestId);
-          pending.resolve(decision);
-        }),
-      respondToUserInput: (
-        _threadId: ThreadId,
-        _requestId: ApprovalRequestId,
-        _answers: ProviderUserInputAnswers,
-      ) => unsupported("session/user_input"),
-      stopSession: (threadId) =>
-        Effect.gen(function* () {
-          const context = yield* requireSession(threadId);
-          yield* disconnectContext(context);
-          sessions.delete(threadId);
-        }),
-      listSessions: () => Effect.sync(() => [...sessions.values()].map(({ session }) => session)),
-      hasSession: (threadId) => Effect.sync(() => sessions.has(threadId)),
-      readThread: (threadId) =>
-        requireSession(threadId).pipe(
-          Effect.map((context) => ({ threadId, turns: context.turns })),
-        ),
-      rollbackThread: () => unsupported("session/rollback"),
-      stopAll: () =>
-        Effect.forEach(sessions.values(), disconnectContext, { discard: true }).pipe(
-          Effect.tap(() => Effect.sync(() => sessions.clear())),
-        ),
-      streamEvents: Stream.fromQueue(events),
-    } satisfies ProviderAdapterShape<CopilotAdapterError>;
+function mapSdkError(method: string, error: CopilotSdkRuntimeError) {
+  return new ProviderAdapterRequestError({
+    provider: PROVIDER,
+    method,
+    detail: error.detail,
+    cause: error,
   });
 }
+
+export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
+  connection: CopilotSdkConnection,
+  options: CopilotAdapterOptions = {},
+) {
+  const instanceId = options.instanceId ?? ProviderInstanceId.make("copilot");
+  const { attachmentsDir } = yield* ServerConfig;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const crypto = yield* Crypto.Crypto;
+  const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const nativeEvents = yield* Queue.unbounded<{
+    readonly threadId: ThreadId;
+    readonly event: SessionEvent;
+  }>();
+  const sessions = new Map<ThreadId, CopilotSessionContext>();
+  const nextId = crypto.randomUUIDv4.pipe(
+    Effect.map((id) => EventId.make(id)),
+    Effect.orDie,
+  );
+  const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const runtimeContext = yield* Effect.context<never>();
+  const runPromise = Effect.runPromiseWith(runtimeContext);
+
+  const emit = (event: ProviderRuntimeEvent) => PubSub.publish(events, event).pipe(Effect.asVoid);
+  const stamp = () => Effect.all({ eventId: nextId, createdAt: nowIso });
+
+  const baseEvent = (threadId: ThreadId, turnId?: TurnId) =>
+    Effect.map(stamp(), (value) => ({
+      ...value,
+      provider: PROVIDER,
+      providerInstanceId: instanceId,
+      threadId,
+      ...(turnId ? { turnId } : {}),
+    }));
+
+  const handlePermissionRequest = Effect.fn("CopilotAdapter.handlePermissionRequest")(function* (
+    threadId: ThreadId,
+    payload: unknown,
+  ) {
+    const context = sessions.get(threadId);
+    const permission = parseCopilotPermission(payload);
+    if (!context || context.stopped || !permission) {
+      const base = yield* baseEvent(threadId, context?.activeTurn?.id);
+      yield* emit({
+        ...base,
+        type: "runtime.error",
+        payload: {
+          message: "Copilot sent an unknown or malformed permission request.",
+          class: "permission_error",
+          detail: payload,
+        },
+        raw: {
+          source: "copilot.sdk.permission",
+          method: "permission.malformed",
+          payload,
+        },
+      });
+      return { kind: "reject" } as const;
+    }
+
+    const automatic = automaticPermissionResult(context.session.runtimeMode, permission);
+    if (automatic) return automatic;
+
+    const requestId = ApprovalRequestId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    const canonical = canonicalPermissionRequest(permission);
+    let resolveDecision!: (decision: ProviderApprovalDecision) => void;
+    const decisionPromise = new Promise<ProviderApprovalDecision>((resolve) => {
+      resolveDecision = resolve;
+    });
+    context.pendingApprovals.set(requestId, { resolve: resolveDecision });
+    const openedBase = yield* baseEvent(threadId, context.activeTurn?.id);
+    yield* emit({
+      ...openedBase,
+      type: "request.opened",
+      requestId: RuntimeRequestId.make(requestId),
+      payload: {
+        requestType: canonical.requestType,
+        detail: canonical.detail,
+        ...(canonical.appName ? { appName: canonical.appName } : {}),
+        options: [...approvalOptionsForPermission(permission)],
+        args: permission,
+      },
+      raw: {
+        source: "copilot.sdk.permission",
+        method: "permission.requested",
+        payload,
+      },
+    });
+
+    const decision = yield* Effect.promise(() => decisionPromise).pipe(
+      Effect.ensuring(Effect.sync(() => context.pendingApprovals.delete(requestId))),
+    );
+    context.pendingApprovals.delete(requestId);
+    const result = approvalDecisionResult(decision, permission);
+    const resolvedBase = yield* baseEvent(threadId, context.activeTurn?.id);
+    yield* emit({
+      ...resolvedBase,
+      type: "request.resolved",
+      requestId: RuntimeRequestId.make(requestId),
+      payload: {
+        requestType: canonical.requestType,
+        decision,
+        resolution: result,
+      },
+      raw: {
+        source: "copilot.sdk.permission",
+        method: "permission.completed",
+        payload: { request: payload, decision },
+      },
+    });
+
+    if (result.kind === "reject" && permission.toolCallId) {
+      context.deniedToolCallIds.add(permission.toolCallId);
+      const turn = context.activeTurn;
+      if (turn?.startedItems.has(permission.toolCallId)) {
+        const deniedBase = yield* baseEvent(threadId, turn.id);
+        yield* emit({
+          ...deniedBase,
+          type: "item.completed",
+          itemId: RuntimeItemId.make(permission.toolCallId),
+          providerRefs: { providerItemId: ProviderItemId.make(permission.toolCallId) },
+          payload: {
+            itemType: "dynamic_tool_call",
+            status: "declined",
+            detail: "The user denied this tool request.",
+          },
+        });
+      }
+    }
+    return result;
+  });
+
+  const requireSession = (
+    threadId: ThreadId,
+  ): Effect.Effect<CopilotSessionContext, ProviderAdapterSessionNotFoundError> => {
+    const context = sessions.get(threadId);
+    return context && !context.stopped
+      ? Effect.succeed(context)
+      : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }));
+  };
+
+  const logNative = (threadId: ThreadId, event: SessionEvent) => {
+    if (!options.nativeEventLogger) return Effect.void;
+    return options.nativeEventLogger.write(
+      {
+        observedAt: event.timestamp,
+        event: {
+          id: event.id,
+          kind: "notification",
+          provider: PROVIDER,
+          providerInstanceId: instanceId,
+          threadId,
+          createdAt: event.timestamp,
+          method: event.type,
+          payload: event,
+        },
+      },
+      threadId,
+    );
+  };
+
+  const emitItemStarted = Effect.fn("CopilotAdapter.emitItemStarted")(function* (
+    context: CopilotSessionContext,
+    key: string,
+    itemId: RuntimeItemId,
+    itemType: "assistant_message" | "reasoning" | "dynamic_tool_call",
+    event: SessionEvent,
+    data?: unknown,
+    title?: string,
+  ) {
+    const turn = context.activeTurn;
+    if (!turn || turn.startedItems.has(key)) return;
+    turn.startedItems.add(key);
+    const base = yield* baseEvent(context.session.threadId, turn.id);
+    yield* emit({
+      ...base,
+      type: "item.started",
+      itemId,
+      providerRefs: { providerItemId: ProviderItemId.make(key) },
+      payload: {
+        itemType,
+        status: "inProgress",
+        ...(title ? { title } : {}),
+        ...(data !== undefined ? { data } : {}),
+      },
+      raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+    });
+  });
+
+  const emitTextDelta = Effect.fn("CopilotAdapter.emitTextDelta")(function* (
+    context: CopilotSessionContext,
+    key: string,
+    itemType: "assistant_message" | "reasoning",
+    streamKind: "assistant_text" | "reasoning_text",
+    delta: string,
+    event: SessionEvent,
+  ) {
+    const turn = context.activeTurn;
+    if (!turn) return;
+    const itemId = RuntimeItemId.make(key);
+    yield* emitItemStarted(context, key, itemId, itemType, event);
+    turn.streamedItems.add(key);
+    const base = yield* baseEvent(context.session.threadId, turn.id);
+    yield* emit({
+      ...base,
+      type: "content.delta",
+      itemId,
+      providerRefs: { providerItemId: ProviderItemId.make(key) },
+      payload: { streamKind, delta },
+      raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+    });
+  });
+
+  const emitTextCompleted = Effect.fn("CopilotAdapter.emitTextCompleted")(function* (
+    context: CopilotSessionContext,
+    key: string,
+    itemType: "assistant_message" | "reasoning",
+    streamKind: "assistant_text" | "reasoning_text",
+    content: string,
+    data: unknown,
+    event: SessionEvent,
+  ) {
+    const turn = context.activeTurn;
+    if (!turn) return;
+    const itemId = RuntimeItemId.make(key);
+    yield* emitItemStarted(context, key, itemId, itemType, event);
+    if (content && !turn.streamedItems.has(key)) {
+      yield* emitTextDelta(context, key, itemType, streamKind, content, event);
+    }
+    const base = yield* baseEvent(context.session.threadId, turn.id);
+    yield* emit({
+      ...base,
+      type: "item.completed",
+      itemId,
+      providerRefs: { providerItemId: ProviderItemId.make(key) },
+      payload: { itemType, status: "completed", data },
+      raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+    });
+  });
+
+  const handleEvent = Effect.fn("CopilotAdapter.handleEvent")(function* (
+    threadId: ThreadId,
+    event: SessionEvent,
+  ) {
+    yield* logNative(threadId, event).pipe(Effect.ignore);
+    const context = sessions.get(threadId);
+    if (!context || context.stopped) return;
+    const turn = context.activeTurn;
+    if (turn) turn.items.push(event);
+
+    switch (event.type) {
+      case "assistant.message_start": {
+        const itemId = RuntimeItemId.make(event.data.messageId);
+        yield* emitItemStarted(context, event.data.messageId, itemId, "assistant_message", event);
+        break;
+      }
+      case "assistant.message_delta": {
+        yield* emitTextDelta(
+          context,
+          event.data.messageId,
+          "assistant_message",
+          "assistant_text",
+          event.data.deltaContent,
+          event,
+        );
+        break;
+      }
+      case "assistant.message": {
+        yield* emitTextCompleted(
+          context,
+          event.data.messageId,
+          "assistant_message",
+          "assistant_text",
+          event.data.content,
+          event.data,
+          event,
+        );
+        break;
+      }
+      case "assistant.reasoning_delta": {
+        yield* emitTextDelta(
+          context,
+          event.data.reasoningId,
+          "reasoning",
+          "reasoning_text",
+          event.data.deltaContent,
+          event,
+        );
+        break;
+      }
+      case "assistant.reasoning": {
+        yield* emitTextCompleted(
+          context,
+          event.data.reasoningId,
+          "reasoning",
+          "reasoning_text",
+          event.data.content,
+          event.data,
+          event,
+        );
+        break;
+      }
+      case "tool.execution_start": {
+        if (!turn) break;
+        const key = event.data.toolCallId;
+        if (context.deniedToolCallIds.has(key)) break;
+        yield* emitItemStarted(
+          context,
+          key,
+          RuntimeItemId.make(key),
+          "dynamic_tool_call",
+          event,
+          event.data,
+          event.data.toolName,
+        );
+        break;
+      }
+      case "tool.execution_partial_result":
+      case "tool.execution_progress": {
+        if (!turn) break;
+        const key = event.data.toolCallId;
+        if (context.deniedToolCallIds.has(key)) break;
+        const base = yield* baseEvent(threadId, turn.id);
+        yield* emit({
+          ...base,
+          type: "item.updated",
+          itemId: RuntimeItemId.make(key),
+          providerRefs: { providerItemId: ProviderItemId.make(key) },
+          payload: {
+            itemType: "dynamic_tool_call",
+            status: "inProgress",
+            detail:
+              event.type === "tool.execution_progress"
+                ? event.data.progressMessage
+                : event.data.partialOutput,
+            data: event.data,
+          },
+          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+        });
+        break;
+      }
+      case "tool.execution_complete": {
+        if (!turn) break;
+        const key = event.data.toolCallId;
+        if (context.deniedToolCallIds.has(key)) break;
+        const base = yield* baseEvent(threadId, turn.id);
+        yield* emit({
+          ...base,
+          type: "item.completed",
+          itemId: RuntimeItemId.make(key),
+          providerRefs: { providerItemId: ProviderItemId.make(key) },
+          payload: {
+            itemType: "dynamic_tool_call",
+            status: event.data.success ? "completed" : "failed",
+            ...(event.data.error?.message ? { detail: event.data.error.message } : {}),
+            data: event.data,
+          },
+          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+        });
+        break;
+      }
+      case "assistant.usage": {
+        if (!turn) break;
+        turn.usage = event.data;
+        const inputTokens = event.data.inputTokens ?? 0;
+        const outputTokens = event.data.outputTokens ?? 0;
+        const reasoningTokens = event.data.reasoningTokens ?? 0;
+        const base = yield* baseEvent(threadId, turn.id);
+        yield* emit({
+          ...base,
+          type: "thread.token-usage.updated",
+          payload: {
+            usage: {
+              usedTokens: inputTokens + outputTokens,
+              totalProcessedTokens: inputTokens + outputTokens,
+              inputTokens,
+              cachedInputTokens: event.data.cacheReadTokens ?? 0,
+              outputTokens,
+              reasoningOutputTokens: reasoningTokens,
+              lastUsedTokens: inputTokens + outputTokens,
+              lastInputTokens: inputTokens,
+              lastCachedInputTokens: event.data.cacheReadTokens ?? 0,
+              lastOutputTokens: outputTokens,
+              lastReasoningOutputTokens: reasoningTokens,
+              ...(event.data.duration === undefined ? {} : { durationMs: event.data.duration }),
+            },
+          },
+          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+        });
+        break;
+      }
+      case "session.usage_info": {
+        const base = yield* baseEvent(threadId, turn?.id);
+        yield* emit({
+          ...base,
+          type: "thread.token-usage.updated",
+          payload: {
+            usage: { usedTokens: event.data.currentTokens, maxTokens: event.data.tokenLimit },
+          },
+          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+        });
+        break;
+      }
+      case "session.idle": {
+        if (!turn) break;
+        context.activeTurn = undefined;
+        context.session = {
+          ...context.session,
+          status: "ready",
+          activeTurnId: undefined,
+          updatedAt: yield* nowIso,
+        };
+        const base = yield* baseEvent(threadId, turn.id);
+        yield* emit({
+          ...base,
+          type: "turn.completed",
+          payload: { state: "completed", ...(turn.usage ? { usage: turn.usage } : {}) },
+          raw: { source: "copilot.sdk.event", messageType: event.type, payload: event },
+        });
+        break;
+      }
+    }
+  });
+  yield* Stream.runForEach(Stream.fromQueue(nativeEvents), ({ threadId, event }) =>
+    handleEvent(threadId, event).pipe(Effect.catchCause(Effect.logError)),
+  ).pipe(Effect.forkScoped);
+
+  const stopSessionInternal = Effect.fn("CopilotAdapter.stopSessionInternal")(function* (
+    context: CopilotSessionContext,
+    emitExit: boolean,
+  ) {
+    if (context.stopped) return;
+    for (const pending of context.pendingApprovals.values()) pending.resolve("cancel");
+    context.pendingApprovals.clear();
+    const activeTurn = context.activeTurn;
+    context.activeTurn = undefined;
+    context.stopped = true;
+    sessions.delete(context.session.threadId);
+    if (activeTurn) {
+      const turnBase = yield* baseEvent(context.session.threadId, activeTurn.id);
+      yield* emit({
+        ...turnBase,
+        type: "turn.completed",
+        payload: { state: "cancelled", stopReason: "session_stopped" },
+      });
+    }
+    yield* context.sdk.disconnect.pipe(
+      Effect.mapError((error) => mapSdkError("disconnect", error)),
+    );
+    context.session = {
+      ...context.session,
+      status: "closed",
+      activeTurnId: undefined,
+      updatedAt: yield* nowIso,
+    };
+    if (emitExit) {
+      const base = yield* baseEvent(context.session.threadId);
+      yield* emit({
+        ...base,
+        type: "session.exited",
+        payload: { reason: "Session stopped.", recoverable: false, exitKind: "graceful" },
+      });
+    }
+  });
+
+  const startSession = Effect.fn("CopilotAdapter.startSession")(function* (
+    input: ProviderSessionStartInput,
+  ) {
+    if (input.provider !== undefined && input.provider !== PROVIDER) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "startSession",
+        issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+      });
+    }
+    if (input.providerInstanceId !== undefined && input.providerInstanceId !== instanceId) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "startSession",
+        issue: `Expected provider instance '${instanceId}'.`,
+      });
+    }
+    if (!input.cwd?.trim()) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "startSession",
+        issue: "cwd is required and must be non-empty.",
+      });
+    }
+    const existing = sessions.get(input.threadId);
+    if (existing) yield* stopSessionInternal(existing, false);
+
+    const threadId = input.threadId;
+    const onEvent = (event: SessionEvent) => {
+      Queue.offerUnsafe(nativeEvents, { threadId, event });
+    };
+    const sdkInput = {
+      workingDirectory: input.cwd.trim(),
+      ...(input.modelSelection?.instanceId === instanceId && input.modelSelection.model
+        ? { model: input.modelSelection.model }
+        : {}),
+      onEvent,
+      onPermissionRequest: (payload: unknown) =>
+        runPromise(handlePermissionRequest(threadId, payload)),
+    };
+    const sdk = yield* connection
+      .createSession(sdkInput)
+      .pipe(Effect.mapError((error) => mapSdkError("createSession", error)));
+    const createdAt = yield* nowIso;
+    const session: ProviderSession = {
+      provider: PROVIDER,
+      providerInstanceId: instanceId,
+      status: "ready",
+      runtimeMode: input.runtimeMode,
+      cwd: input.cwd.trim(),
+      ...(input.modelSelection?.instanceId === instanceId
+        ? { model: input.modelSelection.model }
+        : {}),
+      threadId,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    sessions.set(threadId, {
+      session,
+      sdk,
+      turns: [],
+      pendingApprovals: new Map(),
+      deniedToolCallIds: new Set(),
+      activeTurn: undefined,
+      stopped: false,
+    });
+    const sessionBase = yield* baseEvent(threadId);
+    yield* emit({
+      ...sessionBase,
+      type: "session.started",
+      payload: {},
+    });
+    const threadBase = yield* baseEvent(threadId);
+    yield* emit({
+      ...threadBase,
+      type: "thread.started",
+      payload: { providerThreadId: sdk.sessionId },
+    });
+    return session;
+  });
+
+  const sendTurn = Effect.fn("CopilotAdapter.sendTurn")(function* (input: ProviderSendTurnInput) {
+    const context = yield* requireSession(input.threadId);
+    if (!input.input?.trim() && (!input.attachments || input.attachments.length === 0)) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "sendTurn",
+        issue: "A prompt or attachment is required.",
+      });
+    }
+
+    const attachments: NonNullable<MessageOptions["attachments"]> = [];
+    for (const attachment of input.attachments ?? []) {
+      const resolved = resolveAttachmentPath({ attachmentsDir, attachment });
+      const exists = resolved
+        ? yield* fileSystem.exists(resolved).pipe(Effect.orElseSucceed(() => false))
+        : false;
+      if (!resolved || !exists) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "sendTurn",
+          issue: `Attachment '${attachment.id}' is invalid or unavailable.`,
+        });
+      }
+      attachments.push({ type: "file", path: resolved, displayName: attachment.name });
+    }
+
+    const turnId = TurnId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    const turn: CopilotTurnState = {
+      id: turnId,
+      items: [],
+      startedItems: new Set(),
+      streamedItems: new Set(),
+      usage: undefined,
+    };
+    context.turns.push(turn);
+    context.activeTurn = turn;
+    context.session = {
+      ...context.session,
+      status: "running",
+      activeTurnId: turnId,
+      updatedAt: yield* nowIso,
+    };
+    const base = yield* baseEvent(input.threadId, turnId);
+    yield* emit({
+      ...base,
+      type: "turn.started",
+      payload: context.session.model ? { model: context.session.model } : {},
+    });
+
+    const sendResult = yield* context.sdk
+      .send({
+        prompt: input.input?.trim() ?? "",
+        ...(attachments.length > 0 ? { attachments } : {}),
+      })
+      .pipe(Effect.result);
+    if (sendResult._tag === "Failure") {
+      context.activeTurn = undefined;
+      context.session = {
+        ...context.session,
+        status: "ready",
+        activeTurnId: undefined,
+        updatedAt: yield* nowIso,
+        lastError: sendResult.failure.detail,
+      };
+      const failedBase = yield* baseEvent(input.threadId, turnId);
+      yield* emit({
+        ...failedBase,
+        type: "turn.completed",
+        payload: { state: "failed", errorMessage: sendResult.failure.detail },
+      });
+      return yield* mapSdkError("send", sendResult.failure);
+    }
+    return { threadId: input.threadId, turnId };
+  });
+
+  const unsupported = (method: string) =>
+    Effect.fail(
+      new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method,
+        detail: "GitHub Copilot SDK does not expose this operation through this adapter.",
+      }),
+    );
+
+  const stopAll = Effect.fn("CopilotAdapter.stopAll")(function* () {
+    const results = yield* Effect.forEach(Array.from(sessions.values()), (context) =>
+      stopSessionInternal(context, false).pipe(Effect.result),
+    );
+    const failure = results.find((result) => result._tag === "Failure");
+    if (failure) return yield* failure.failure;
+  });
+
+  const adapter: ProviderAdapterShape<
+    | ProviderAdapterRequestError
+    | ProviderAdapterSessionNotFoundError
+    | ProviderAdapterValidationError
+  > = {
+    provider: PROVIDER,
+    capabilities: { sessionModelSwitch: "unsupported" },
+    startSession,
+    sendTurn,
+    interruptTurn: () => unsupported("interruptTurn"),
+    respondToRequest: (threadId, requestId, decision) =>
+      Effect.gen(function* () {
+        const context = yield* requireSession(threadId);
+        const pending = context.pendingApprovals.get(requestId);
+        if (!pending) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "respondToRequest",
+            detail: `Unknown pending approval request: ${requestId}`,
+          });
+        }
+        context.pendingApprovals.delete(requestId);
+        pending.resolve(decision);
+      }),
+    respondToUserInput: () => unsupported("respondToUserInput"),
+    stopSession: (threadId) =>
+      requireSession(threadId).pipe(
+        Effect.flatMap((context) => stopSessionInternal(context, true)),
+      ),
+    listSessions: () =>
+      Effect.sync(() => Array.from(sessions.values(), ({ session }) => ({ ...session }))),
+    hasSession: (threadId) =>
+      Effect.sync(() => {
+        const context = sessions.get(threadId);
+        return context !== undefined && !context.stopped;
+      }),
+    readThread: (threadId) =>
+      requireSession(threadId).pipe(
+        Effect.map((context) => ({
+          threadId,
+          turns: context.turns.map((turn) => ({ id: turn.id, items: [...turn.items] })),
+        })),
+      ),
+    rollbackThread: () => unsupported("rollbackThread"),
+    stopAll,
+    streamEvents: Stream.fromPubSub(events),
+  };
+
+  yield* Effect.addFinalizer(() =>
+    adapter.stopAll().pipe(
+      Effect.catch((error) => Effect.logWarning(errorDetail(error))),
+      Effect.andThen(PubSub.shutdown(events)),
+    ),
+  );
+
+  return adapter;
+});

@@ -76,7 +76,14 @@ function runtimeLayer(input: {
           return {
             authStatus: input.auth ?? Effect.succeed(authenticated),
             models: input.models ?? Effect.succeed(inventory),
-            createSession: () => Effect.die("Session creation is not used by discovery tests."),
+            createSession: () =>
+              Effect.fail(
+                new CopilotSdkRuntimeError({
+                  operation: "createSession",
+                  kind: "failure",
+                  detail: "not used by provider discovery tests",
+                }),
+              ),
           };
         }),
         () => Effect.sync(() => input.stops?.push(1)),

@@ -1,23 +1,33 @@
+import type { SessionEvent } from "@github/copilot-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import type { SessionEvent } from "@github/copilot-sdk";
 import {
   ApprovalRequestId,
+  type ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderInstanceId,
-  type ProviderApprovalDecision,
+  type ProviderRuntimeEvent,
   type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
-import * as Result from "effect/Result";
+import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
-import type { CopilotSdkConnection, CopilotSdkSession } from "../CopilotSdkRuntime.ts";
+import type {
+  CopilotSdkConnection,
+  CopilotSdkRuntimeShape,
+  CopilotSdkSession,
+  CopilotSdkSessionStartInput,
+} from "../CopilotSdkRuntime.ts";
+import { CopilotSdkRuntimeError as SdkError } from "../CopilotSdkRuntime.ts";
 import type { CopilotPermission } from "../CopilotPermissions.ts";
 import { makeCopilotAdapter } from "./CopilotAdapter.ts";
 
@@ -25,194 +35,370 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-copilot-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-function fakeSession(sessionId: string): CopilotSdkSession {
+function fakeSession(
+  sessionId: string,
+  options: {
+    readonly send?: CopilotSdkSession["send"];
+    readonly onDisconnect?: () => void;
+  } = {},
+): CopilotSdkSession {
   return {
     sessionId,
-    send: () => Effect.succeed("message-1"),
-    abort: Effect.void,
-    disconnect: Effect.void,
+    send: options.send ?? (() => Effect.succeed("message-1")),
+    disconnect: Effect.sync(() => options.onDisconnect?.()),
   };
 }
 
-function fakeConnection() {
-  const createInputs: Array<Parameters<CopilotSdkConnection["createSession"]>[0]> = [];
+let eventSequence = 0;
+let sessionSequence = 0;
+
+function event<T extends SessionEvent>(value: Omit<T, "id" | "parentId" | "timestamp">): T {
+  eventSequence += 1;
+  return {
+    id: `test-event-${eventSequence}`,
+    parentId: null,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    ...value,
+  } as T;
+}
+
+function runtimeWith(
+  createSession: CopilotSdkConnection["createSession"],
+  options: { readonly onRelease?: () => void } = {},
+): CopilotSdkRuntimeShape {
   const connection: CopilotSdkConnection = {
     authStatus: Effect.succeed({ isAuthenticated: true }),
     models: Effect.succeed([]),
-    createSession: (input) => {
-      createInputs.push(input);
-      return Effect.succeed(fakeSession(`copilot-session-${createInputs.length}`));
-    },
+    createSession,
   };
-  return { connection, createInputs };
+  return {
+    connect: () =>
+      Effect.acquireRelease(Effect.succeed(connection), () =>
+        Effect.sync(() => options.onRelease?.()),
+      ),
+  };
 }
+
+const makeTestAdapter = (
+  runtime: CopilotSdkRuntimeShape,
+  options?: Parameters<typeof makeCopilotAdapter>[1],
+) =>
+  runtime
+    .connect({ binaryPath: "copilot", environment: {}, platform: "darwin" })
+    .pipe(Effect.flatMap((connection) => makeCopilotAdapter(connection, options)));
+
+const startInput = (threadId: ThreadId, instanceId = ProviderInstanceId.make("copilot_work")) => ({
+  threadId,
+  provider: ProviderDriverKind.make("copilot"),
+  providerInstanceId: instanceId,
+  cwd: process.cwd(),
+  runtimeMode: "full-access" as const,
+});
 
 it.layer(testLayer)("CopilotAdapter", (it) => {
   it.effect("starts one isolated SDK session for a T3 thread", () =>
     Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
+      const createInputs: Array<Parameters<CopilotSdkConnection["createSession"]>[0]> = [];
+      const runtime = runtimeWith((input) => {
+        createInputs.push(input);
+        return Effect.succeed(fakeSession("copilot-session-1"));
+      });
       const instanceId = ProviderInstanceId.make("copilot_work");
-      const adapter = yield* makeCopilotAdapter(connection, { instanceId });
+      const adapter = yield* makeTestAdapter(runtime, { instanceId });
       const threadId = ThreadId.make("thread-1");
 
-      const session = yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("copilot"),
-        providerInstanceId: instanceId,
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      const session = yield* adapter.startSession(startInput(threadId, instanceId));
 
       assert.equal(session.threadId, threadId);
       assert.equal(session.providerInstanceId, instanceId);
-      assert.deepEqual(session.resumeCursor, { sessionId: "copilot-session-1" });
       assert.equal(createInputs[0]?.workingDirectory, process.cwd());
       assert.isTrue(yield* adapter.hasSession(threadId));
       assert.lengthOf(yield* adapter.listSessions(), 1);
     }),
   );
 
-  it.effect("streams a basic Copilot turn through canonical runtime events", () =>
+  it.effect("surfaces SDK session creation failures without retaining ownership", () =>
     Effect.gen(function* () {
-      const connection: CopilotSdkConnection = {
-        authStatus: Effect.succeed({ isAuthenticated: true }),
-        models: Effect.succeed([]),
-        createSession: (input) =>
-          Effect.succeed({
-            ...fakeSession("copilot-session-stream"),
-            send: () =>
-              Effect.sync(() => {
-                input.onEvent({
-                  id: "assistant-start",
-                  parentId: null,
-                  timestamp: "2026-09-02T00:00:00.000Z",
-                  type: "assistant.message_start",
-                  data: { messageId: "message-1" },
-                } as unknown as SessionEvent);
-                input.onEvent({
-                  id: "assistant-delta",
-                  parentId: "assistant-start",
-                  timestamp: "2026-09-02T00:00:01.000Z",
-                  type: "assistant.message_delta",
-                  data: { messageId: "message-1", deltaContent: "Hello" },
-                } as unknown as SessionEvent);
-                input.onEvent({
-                  id: "assistant-complete",
-                  parentId: "assistant-delta",
-                  timestamp: "2026-09-02T00:00:02.000Z",
-                  type: "assistant.message",
-                  data: { messageId: "message-1", content: "Hello" },
-                } as unknown as SessionEvent);
-                input.onEvent({
-                  id: "session-idle",
-                  parentId: "assistant-complete",
-                  timestamp: "2026-09-02T00:00:03.000Z",
-                  type: "session.idle",
-                  data: {},
-                } as unknown as SessionEvent);
-                return "message-1";
-              }),
+      const runtime = runtimeWith(() =>
+        Effect.fail(
+          new SdkError({
+            operation: "createSession",
+            kind: "failure",
+            detail: "creation rejected",
           }),
-      };
-      const adapter = yield* makeCopilotAdapter(connection);
-      const threadId = ThreadId.make("thread-stream");
-      const eventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(8),
-        Stream.runCollect,
-        Effect.forkChild,
+        ),
       );
-      yield* adapter.startSession({
-        threadId,
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
-      const turn = yield* adapter.sendTurn({ threadId, input: "Say hello" });
-      const events = [...(yield* Fiber.join(eventsFiber))];
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("create-failure");
 
-      assert.includeMembers(
-        events.map(({ type }) => type),
-        [
-          "session.started",
-          "thread.started",
-          "turn.started",
-          "item.started",
-          "content.delta",
-          "item.completed",
-          "turn.completed",
-        ],
-      );
-      assert.isTrue(events.every((event) => event.providerInstanceId === "copilot"));
-      assert.isTrue(
-        events
-          .filter((event) => event.turnId !== undefined)
-          .every((event) => event.turnId === turn.turnId),
-      );
+      const result = yield* adapter
+        .startSession(startInput(threadId, ProviderInstanceId.make("copilot")))
+        .pipe(Effect.result);
+
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.equal(result.failure._tag, "ProviderAdapterRequestError");
+      assert.isFalse(yield* adapter.hasSession(threadId));
     }),
   );
 
-  it.effect("opens a canonical shell approval and returns an interactive allow", () =>
+  it.effect("maps streaming assistant, reasoning, tool, usage, and completion events", () =>
     Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
-      const adapter = yield* makeCopilotAdapter(connection);
-      const threadId = ThreadId.make("thread-approval");
-      yield* adapter.startSession({
-        threadId,
-        cwd: process.cwd(),
-        runtimeMode: "approval-required",
+      let sdkInput: CopilotSdkSessionStartInput | undefined;
+      const nativeEvents: Array<unknown> = [];
+      const runtime = runtimeWith((input) => {
+        sdkInput = input;
+        return Effect.succeed(
+          fakeSession("stream-session", {
+            send: () =>
+              Effect.sync(() => {
+                input.onEvent(
+                  event({
+                    type: "assistant.reasoning_delta",
+                    ephemeral: true,
+                    data: { reasoningId: "reason-1", deltaContent: "Thinking" },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "assistant.message_delta",
+                    ephemeral: true,
+                    data: { messageId: "message-1", deltaContent: "Hello" },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "assistant.reasoning",
+                    data: { reasoningId: "reason-1", content: "Thinking" },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "assistant.message",
+                    data: { messageId: "message-1", content: "Hello" },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "tool.execution_start",
+                    data: { toolCallId: "tool-1", toolName: "shell", arguments: { cmd: "pwd" } },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "tool.execution_progress",
+                    ephemeral: true,
+                    data: { toolCallId: "tool-1", progressMessage: "running" },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "tool.execution_complete",
+                    data: { toolCallId: "tool-1", success: true },
+                  }),
+                );
+                input.onEvent(
+                  event({
+                    type: "assistant.usage",
+                    ephemeral: true,
+                    data: { model: "gpt-5", inputTokens: 10, outputTokens: 4, reasoningTokens: 2 },
+                  }),
+                );
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return "message-1";
+              }),
+          }),
+        );
       });
-
-      const responseFiber = yield* Effect.promise(() =>
-        createInputs[0]!.onPermissionRequest({
-          kind: "shell",
-          fullCommandText: "pnpm test",
-          intention: "Run the focused test",
-          commands: [{ identifier: "pnpm", readOnly: true }],
-          possiblePaths: [],
-          possibleUrls: [],
-          hasWriteFileRedirection: false,
-          canOfferSessionApproval: true,
-          toolCallId: "tool-1",
-        }),
+      const adapter = yield* makeTestAdapter(runtime, {
+        nativeEventLogger: {
+          filePath: "memory",
+          write: (entry) => Effect.sync(() => nativeEvents.push(entry)),
+          close: () => Effect.void,
+        },
+      });
+      const threadId = ThreadId.make("stream-thread");
+      const completed = yield* Deferred.make<void>();
+      const observed = yield* Ref.make<Array<string>>([]);
+      yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) =>
+        Ref.update(observed, (types) => [...types, runtimeEvent.type]).pipe(
+          Effect.andThen(
+            runtimeEvent.type === "turn.completed"
+              ? Deferred.succeed(completed, undefined)
+              : Effect.void,
+          ),
+        ),
       ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
 
-      const opened = Option.getOrThrow(
-        yield* adapter.streamEvents.pipe(
-          Stream.filter((event) => event.type === "request.opened"),
-          Stream.runHead,
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+      const turn = yield* adapter.sendTurn({ threadId, input: "Say hello" });
+      yield* Deferred.await(completed);
+
+      const types = yield* Ref.get(observed);
+      assert.includeMembers(types, [
+        "turn.started",
+        "item.started",
+        "content.delta",
+        "item.updated",
+        "item.completed",
+        "thread.token-usage.updated",
+        "turn.completed",
+      ]);
+      assert.isDefined(sdkInput);
+      assert.isAtLeast(nativeEvents.length, 9);
+      const snapshot = yield* adapter.readThread(threadId);
+      assert.equal(snapshot.turns[0]?.id, turn.turnId);
+      assert.lengthOf(snapshot.turns[0]?.items ?? [], 9);
+    }),
+  );
+
+  it.effect("completes an empty-output turn and reports send failures", () =>
+    Effect.gen(function* () {
+      let sendCount = 0;
+      const runtime = runtimeWith((input) =>
+        Effect.succeed(
+          fakeSession("empty-session", {
+            send: () => {
+              sendCount += 1;
+              if (sendCount === 1) {
+                input.onEvent(event({ type: "session.idle", data: {} }));
+                return Effect.succeed("empty-message");
+              }
+              return Effect.fail(
+                new SdkError({ operation: "send", kind: "failure", detail: "send rejected" }),
+              );
+            },
+          }),
         ),
       );
-      assert.equal(opened.type, "request.opened");
-      if (opened.type !== "request.opened") return;
-      assert.equal(opened.payload.requestType, "exec_command_approval");
-      assert.equal(opened.payload.detail, "pnpm test");
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("empty-thread");
+      const completions = yield* Ref.make<Array<unknown>>([]);
+      const firstCompletion = yield* Deferred.make<void>();
+      const twoCompletions = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) =>
+        runtimeEvent.type === "turn.completed"
+          ? Ref.update(completions, (values) => [...values, runtimeEvent.payload]).pipe(
+              Effect.andThen(Deferred.succeed(firstCompletion, undefined)),
+              Effect.andThen(Ref.get(completions)),
+              Effect.flatMap((values) =>
+                values.length >= 2 ? Deferred.succeed(twoCompletions, undefined) : Effect.void,
+              ),
+            )
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
 
-      yield* adapter.respondToRequest(
-        threadId,
-        ApprovalRequestId.make(opened.requestId!),
-        "accept",
-      );
-      assert.deepEqual(yield* Fiber.join(responseFiber), {
-        kind: "approve-once",
-        approvedInteractively: true,
+      yield* adapter.sendTurn({ threadId, input: "Return nothing" });
+      yield* Deferred.await(firstCompletion);
+      const failed = yield* adapter.sendTurn({ threadId, input: "Fail" }).pipe(Effect.result);
+      yield* Deferred.await(twoCompletions);
+
+      assert.equal(failed._tag, "Failure");
+      const payloads = yield* Ref.get(completions);
+      assert.deepInclude(payloads, { state: "completed" });
+      assert.deepInclude(payloads, { state: "failed", errorMessage: "send rejected" });
+    }),
+  );
+
+  it.effect("passes resolved attachments to the SDK and rejects unresolved identifiers", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const threadId = ThreadId.make("attachment-thread");
+      const attachment = {
+        type: "file" as const,
+        id: "attachment-thread-00000000-0000-4000-8000-000000000001",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+      };
+      const storedPath = resolveAttachmentPath({
+        attachmentsDir: config.attachmentsDir,
+        attachment,
       });
-      const resolved = Option.getOrThrow(
-        yield* adapter.streamEvents.pipe(
-          Stream.filter((event) => event.type === "request.resolved"),
-          Stream.runHead,
+      assert.isNotNull(storedPath);
+      yield* fileSystem.writeFileString(storedPath!, "hello");
+      const sends: Array<Parameters<CopilotSdkSession["send"]>[0]> = [];
+      const runtime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("attachment-session", {
+            send: (input) => {
+              sends.push(input);
+              return Effect.succeed("attachment-message");
+            },
+          }),
         ),
       );
-      assert.equal(resolved.type, "request.resolved");
-      if (resolved.type === "request.resolved") {
-        assert.equal(resolved.payload.decision, "accept");
+      const adapter = yield* makeTestAdapter(runtime);
+      yield* adapter.startSession(startInput(threadId, ProviderInstanceId.make("copilot")));
+
+      yield* adapter.sendTurn({ threadId, input: "Read it", attachments: [attachment] });
+      const invalid = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Read it",
+          attachments: [{ ...attachment, id: "unresolved-attachment" }],
+        })
+        .pipe(Effect.result);
+
+      assert.equal(sends[0]?.attachments?.[0]?.type, "file");
+      assert.equal(
+        sends[0]?.attachments?.[0]?.type === "file" ? sends[0].attachments[0].path : "",
+        storedPath,
+      );
+      assert.equal(invalid._tag, "Failure");
+      if (invalid._tag === "Failure") {
+        assert.notInclude(invalid.failure.message, config.attachmentsDir);
       }
+    }),
+  );
+
+  it.effect("keeps session ownership isolated between provider instances", () =>
+    Effect.gen(function* () {
+      const runtime = runtimeWith(() => Effect.succeed(fakeSession("owned-session")));
+      const firstInstance = ProviderInstanceId.make("copilot_personal");
+      const secondInstance = ProviderInstanceId.make("copilot_work");
+      const firstAdapter = yield* makeTestAdapter(runtime, { instanceId: firstInstance });
+      const secondAdapter = yield* makeTestAdapter(runtime, { instanceId: secondInstance });
+      const firstThread = ThreadId.make("personal-thread");
+      const secondThread = ThreadId.make("work-thread");
+
+      yield* firstAdapter.startSession(startInput(firstThread, firstInstance));
+      yield* secondAdapter.startSession(startInput(secondThread, secondInstance));
+
+      assert.isTrue(yield* firstAdapter.hasSession(firstThread));
+      assert.isFalse(yield* firstAdapter.hasSession(secondThread));
+      assert.isFalse(yield* secondAdapter.hasSession(firstThread));
+      assert.isTrue(yield* secondAdapter.hasSession(secondThread));
+      assert.deepEqual(
+        (yield* firstAdapter.listSessions()).map((session) => session.threadId),
+        [firstThread],
+      );
+      assert.deepEqual(
+        (yield* secondAdapter.listSessions()).map((session) => session.threadId),
+        [secondThread],
+      );
     }),
   );
 
   it.effect("honors file, shell, and generic approvals across every runtime mode", () =>
     Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
-      const adapter = yield* makeCopilotAdapter(connection);
+      const createInputs: Array<CopilotSdkSessionStartInput> = [];
+      const runtime = runtimeWith((input) => {
+        createInputs.push(input);
+        return Effect.succeed(fakeSession(`approval-session-${createInputs.length}`));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const opened =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) =>
+        runtimeEvent.type === "request.opened" ? Queue.offer(opened, runtimeEvent) : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+
       const write = {
         kind: "write",
         fileName: "src/index.ts",
@@ -236,6 +422,10 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
         readonly name: string;
         readonly mode: RuntimeMode;
         readonly permission: CopilotPermission;
+        readonly requestType:
+          | "file_change_approval"
+          | "exec_command_approval"
+          | "dynamic_tool_call";
         readonly decision?: ProviderApprovalDecision;
         readonly result: unknown;
       }> = [
@@ -243,6 +433,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "approval-file-allow",
           mode: "approval-required",
           permission: write,
+          requestType: "file_change_approval",
           decision: "accept",
           result: { kind: "approve-once", approvedInteractively: true },
         },
@@ -250,6 +441,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "approval-shell-deny",
           mode: "approval-required",
           permission: shell,
+          requestType: "exec_command_approval",
           decision: "decline",
           result: { kind: "reject", feedback: "The user denied this request." },
         },
@@ -257,6 +449,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "approval-generic-session",
           mode: "approval-required",
           permission: generic,
+          requestType: "dynamic_tool_call",
           decision: "acceptForSession",
           result: {
             kind: "approve-for-session",
@@ -267,12 +460,14 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "edits-file-auto",
           mode: "auto-accept-edits",
           permission: write,
+          requestType: "file_change_approval",
           result: { kind: "approve-once" },
         },
         {
           name: "edits-shell-allow",
           mode: "auto-accept-edits",
           permission: shell,
+          requestType: "exec_command_approval",
           decision: "accept",
           result: { kind: "approve-once", approvedInteractively: true },
         },
@@ -280,6 +475,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "edits-generic-deny",
           mode: "auto-accept-edits",
           permission: generic,
+          requestType: "dynamic_tool_call",
           decision: "decline",
           result: { kind: "reject", feedback: "The user denied this request." },
         },
@@ -287,6 +483,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "auto-file-session",
           mode: "auto",
           permission: write,
+          requestType: "file_change_approval",
           decision: "acceptForSession",
           result: { kind: "approve-for-session", approval: { kind: "write" } },
         },
@@ -294,6 +491,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "auto-shell-allow",
           mode: "auto",
           permission: shell,
+          requestType: "exec_command_approval",
           decision: "accept",
           result: { kind: "approve-once", approvedInteractively: true },
         },
@@ -301,6 +499,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: "auto-generic-deny",
           mode: "auto",
           permission: generic,
+          requestType: "dynamic_tool_call",
           decision: "decline",
           result: { kind: "reject", feedback: "The user denied this request." },
         },
@@ -308,6 +507,9 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           name: `full-access-${index}`,
           mode: "full-access" as const,
           permission,
+          requestType: ["file_change_approval", "exec_command_approval", "dynamic_tool_call"][
+            index
+          ] as "file_change_approval" | "exec_command_approval" | "dynamic_tool_call",
           result: { kind: "approve-once" },
         })),
       ];
@@ -315,8 +517,7 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
       for (const testCase of cases) {
         const threadId = ThreadId.make(`thread-${testCase.name}`);
         yield* adapter.startSession({
-          threadId,
-          cwd: process.cwd(),
+          ...startInput(threadId, ProviderInstanceId.make("copilot")),
           runtimeMode: testCase.mode,
         });
         const sdkInput = createInputs.at(-1)!;
@@ -329,18 +530,15 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
           continue;
         }
 
-        const openedFiber = yield* adapter.streamEvents.pipe(
-          Stream.filter((event) => event.type === "request.opened" && event.threadId === threadId),
-          Stream.runHead,
-          Effect.forkChild,
-        );
         const resultFiber = yield* Effect.promise(() =>
           sdkInput.onPermissionRequest(testCase.permission),
         ).pipe(Effect.forkChild);
-        const opened = Option.getOrThrow(yield* Fiber.join(openedFiber));
+        const request = yield* Queue.take(opened);
+        assert.equal(request.threadId, threadId);
+        assert.equal(request.payload.requestType, testCase.requestType);
         yield* adapter.respondToRequest(
           threadId,
-          ApprovalRequestId.make(opened.requestId!),
+          ApprovalRequestId.make(request.requestId!),
           testCase.decision,
         );
         assert.deepEqual(yield* Fiber.join(resultFiber), testCase.result, testCase.name);
@@ -348,242 +546,145 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
     }),
   );
 
-  it.effect("returns an exact session scope without approving unrelated operations", () =>
+  it.effect("fails malformed requests visibly and keeps denied tools terminal", () =>
     Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
-      const adapter = yield* makeCopilotAdapter(connection);
-      const threadId = ThreadId.make("thread-scoped-session");
+      let sdkInput: CopilotSdkSessionStartInput | undefined;
+      const runtime = runtimeWith((input) => {
+        sdkInput = input;
+        return Effect.succeed(fakeSession("denied-session"));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("denied-thread");
+      const runtimeError =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "runtime.error" }>>();
+      const opened =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const started =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
+      const completed =
+        yield* Queue.unbounded<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
+      yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) => {
+        switch (runtimeEvent.type) {
+          case "runtime.error":
+            return Deferred.succeed(runtimeError, runtimeEvent);
+          case "request.opened":
+            return Queue.offer(opened, runtimeEvent);
+          case "item.started":
+            return Queue.offer(started, runtimeEvent);
+          case "item.completed":
+            return Queue.offer(completed, runtimeEvent);
+          default:
+            return Effect.void;
+        }
+      }).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
       yield* adapter.startSession({
-        threadId,
-        cwd: process.cwd(),
+        ...startInput(threadId, ProviderInstanceId.make("copilot")),
         runtimeMode: "approval-required",
       });
-      const sdkInput = createInputs[0]!;
-      const firstOpenedFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.type === "request.opened" && event.threadId === threadId),
-        Stream.runHead,
-        Effect.forkChild,
-      );
-      const firstResultFiber = yield* Effect.promise(() =>
-        sdkInput.onPermissionRequest({
-          kind: "custom-tool",
-          toolName: "preview",
-          toolDescription: "Run preview",
-        }),
-      ).pipe(Effect.forkChild);
-      const firstOpened = Option.getOrThrow(yield* Fiber.join(firstOpenedFiber));
-      yield* adapter.respondToRequest(
-        threadId,
-        ApprovalRequestId.make(firstOpened.requestId!),
-        "acceptForSession",
-      );
-      assert.deepEqual(yield* Fiber.join(firstResultFiber), {
-        kind: "approve-for-session",
-        approval: { kind: "custom-tool", toolName: "preview" },
-      });
-
-      const unrelatedOpenedFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.type === "request.opened" && event.threadId === threadId),
-        Stream.runHead,
-        Effect.forkChild,
-      );
-      const unrelatedResultFiber = yield* Effect.promise(() =>
-        sdkInput.onPermissionRequest({
-          kind: "custom-tool",
-          toolName: "deploy",
-          toolDescription: "Run deploy",
-        }),
-      ).pipe(Effect.forkChild);
-      const unrelatedOpened = Option.getOrThrow(yield* Fiber.join(unrelatedOpenedFiber));
-      yield* adapter.respondToRequest(
-        threadId,
-        ApprovalRequestId.make(unrelatedOpened.requestId!),
-        "decline",
-      );
-      assert.equal((yield* Fiber.join(unrelatedResultFiber)).kind, "reject");
-    }),
-  );
-
-  it.effect("rejects malformed payloads with a visible canonical failure", () =>
-    Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
-      const adapter = yield* makeCopilotAdapter(connection);
-      yield* adapter.startSession({
-        threadId: ThreadId.make("thread-malformed"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      assert.isDefined(sdkInput);
 
       assert.deepEqual(
         yield* Effect.promise(() =>
-          createInputs[0]!.onPermissionRequest({ kind: "shell", fullCommandText: 42 }),
+          sdkInput!.onPermissionRequest({ kind: "shell", fullCommandText: 42 }),
         ),
         { kind: "reject" },
       );
-      const failure = Option.getOrThrow(
-        yield* adapter.streamEvents.pipe(
-          Stream.filter((event) => event.type === "runtime.error"),
-          Stream.runHead,
-        ),
-      );
-      assert.equal(failure.type, "runtime.error");
-      if (failure.type === "runtime.error") {
-        assert.equal(failure.payload.class, "permission_error");
-      }
-    }),
-  );
+      assert.equal((yield* Deferred.await(runtimeError)).payload.class, "permission_error");
 
-  it.effect("isolates pending approvals by thread and request identifier", () =>
-    Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
-      const instanceId = ProviderInstanceId.make("copilot_isolated");
-      const adapter = yield* makeCopilotAdapter(connection, { instanceId });
-      const firstThread = ThreadId.make("thread-first");
-      const secondThread = ThreadId.make("thread-second");
-      for (const threadId of [firstThread, secondThread]) {
-        yield* adapter.startSession({
-          threadId,
-          cwd: process.cwd(),
-          runtimeMode: "approval-required",
-        });
-      }
-
-      const openedFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.type === "request.opened"),
-        Stream.take(2),
-        Stream.runCollect,
-        Effect.forkChild,
+      yield* adapter.sendTurn({ threadId, input: "Run a tool" });
+      sdkInput!.onEvent(
+        event({
+          type: "tool.execution_start",
+          data: { toolCallId: "tool-denied", toolName: "shell", arguments: { cmd: "rm example" } },
+        }),
       );
-      const request = {
-        kind: "custom-tool",
-        toolName: "preview",
-        toolDescription: "Create a preview",
-      } as const;
-      const firstResponse = yield* Effect.promise(() =>
-        createInputs[0]!.onPermissionRequest(request),
-      ).pipe(Effect.forkChild);
-      const secondResponse = yield* Effect.promise(() =>
-        createInputs[1]!.onPermissionRequest(request),
-      ).pipe(Effect.forkChild);
-      const opened = [...(yield* Fiber.join(openedFiber))].filter(
-        (event) => event.type === "request.opened",
-      );
-      assert.lengthOf(opened, 2);
-      const firstRequest = opened.find((event) => event.threadId === firstThread)!;
-      const secondRequest = opened.find((event) => event.threadId === secondThread)!;
-      assert.notEqual(firstRequest.requestId, secondRequest.requestId);
+      assert.equal((yield* Queue.take(started)).itemId, "tool-denied");
 
-      const crossThread = yield* adapter
-        .respondToRequest(secondThread, ApprovalRequestId.make(firstRequest.requestId!), "accept")
-        .pipe(Effect.result);
-      assert.isTrue(Result.isFailure(crossThread));
-
-      yield* adapter.respondToRequest(
-        firstThread,
-        ApprovalRequestId.make(firstRequest.requestId!),
-        "decline",
-      );
-      yield* adapter.respondToRequest(
-        secondThread,
-        ApprovalRequestId.make(secondRequest.requestId!),
-        "acceptForSession",
-      );
-      assert.equal((yield* Fiber.join(firstResponse)).kind, "reject");
-      assert.equal((yield* Fiber.join(secondResponse)).kind, "approve-for-session");
-    }),
-  );
-
-  it.effect("keeps a denied tool declined when Copilot later reports completion", () =>
-    Effect.gen(function* () {
-      const { connection, createInputs } = fakeConnection();
-      const adapter = yield* makeCopilotAdapter(connection);
-      const threadId = ThreadId.make("thread-denied");
-      yield* adapter.startSession({
-        threadId,
-        cwd: process.cwd(),
-        runtimeMode: "approval-required",
-      });
-      const sdkInput = createInputs[0]!;
-      sdkInput.onEvent({
-        id: "event-tool-start",
-        parentId: null,
-        timestamp: "2026-09-02T00:00:00.000Z",
-        type: "tool.execution_start",
-        data: {
-          toolCallId: "tool-denied",
-          toolName: "shell",
-          arguments: { command: "rm example" },
-        },
-      } as SessionEvent);
-      const responseFiber = yield* Effect.promise(() =>
-        sdkInput.onPermissionRequest({
+      const deniedResult = yield* Effect.promise(() =>
+        sdkInput!.onPermissionRequest({
           kind: "shell",
           fullCommandText: "rm example",
           intention: "Remove example",
           commands: [{ identifier: "rm", readOnly: false }],
-          possiblePaths: ["example"],
-          possibleUrls: [],
-          hasWriteFileRedirection: false,
           canOfferSessionApproval: true,
           toolCallId: "tool-denied",
         }),
       ).pipe(Effect.forkChild);
-      const initial = [
-        ...(yield* adapter.streamEvents.pipe(
-          Stream.filter(
-            (event) => event.type === "item.started" || event.type === "request.opened",
-          ),
-          Stream.take(2),
-          Stream.runCollect,
-        )),
-      ];
-      const opened = initial.find((event) => event.type === "request.opened")!;
+      const approval = yield* Queue.take(opened);
       yield* adapter.respondToRequest(
         threadId,
-        ApprovalRequestId.make(opened.requestId!),
+        ApprovalRequestId.make(approval.requestId!),
         "decline",
       );
-      assert.equal((yield* Fiber.join(responseFiber)).kind, "reject");
-      const denied = [
-        ...(yield* adapter.streamEvents.pipe(
-          Stream.filter(
-            (event) => event.type === "request.resolved" || event.type === "item.completed",
-          ),
-          Stream.take(2),
-          Stream.runCollect,
-        )),
-      ];
-      assert.equal(denied[0]?.type, "request.resolved");
-      assert.equal(denied[1]?.type, "item.completed");
-      if (denied[1]?.type === "item.completed") {
-        assert.equal(denied[1].payload.itemType, "command_execution");
-        assert.equal(denied[1].payload.status, "declined");
-      }
+      assert.equal((yield* Fiber.join(deniedResult)).kind, "reject");
+      assert.equal((yield* Queue.take(completed)).payload.status, "declined");
 
-      sdkInput.onEvent({
-        id: "event-tool-complete",
-        parentId: "event-tool-start",
-        timestamp: "2026-09-02T00:00:01.000Z",
-        type: "tool.execution_complete",
-        data: { toolCallId: "tool-denied", success: true },
-      } as SessionEvent);
-      sdkInput.onEvent({
-        id: "event-tool-complete-replayed",
-        parentId: "event-tool-complete",
-        timestamp: "2026-09-02T00:00:02.000Z",
-        type: "tool.execution_complete",
-        data: { toolCallId: "tool-denied", success: true },
-      } as SessionEvent);
-      yield* Effect.promise(() => sdkInput.onPermissionRequest({ kind: "unknown" }));
-      const next = Option.getOrThrow(
-        yield* adapter.streamEvents.pipe(
-          Stream.filter(
-            (event) => event.type === "item.completed" || event.type === "runtime.error",
-          ),
-          Stream.runHead,
-        ),
+      for (let index = 0; index < 2; index += 1) {
+        sdkInput!.onEvent(
+          event({
+            type: "tool.execution_complete",
+            data: { toolCallId: "tool-denied", success: true },
+          }),
+        );
+      }
+      sdkInput!.onEvent(
+        event({
+          type: "tool.execution_start",
+          data: { toolCallId: "tool-sentinel", toolName: "preview", arguments: {} },
+        }),
       );
-      assert.equal(next.type, "runtime.error");
+      sdkInput!.onEvent(
+        event({
+          type: "tool.execution_complete",
+          data: { toolCallId: "tool-sentinel", success: true },
+        }),
+      );
+      const sentinel = yield* Queue.take(completed);
+      assert.equal(sentinel.itemId, "tool-sentinel");
+      assert.equal(sentinel.payload.status, "completed");
+    }),
+  );
+
+  it.effect("disconnects stopped sessions and all remaining sessions during scope teardown", () =>
+    Effect.gen(function* () {
+      let disconnects = 0;
+      let runtimeReleases = 0;
+      const runtime = runtimeWith(
+        () =>
+          Effect.succeed(
+            fakeSession(`scope-session-${(sessionSequence += 1)}`, {
+              onDisconnect: () => (disconnects += 1),
+            }),
+          ),
+        { onRelease: () => (runtimeReleases += 1) },
+      );
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const adapter = yield* makeTestAdapter(runtime);
+          const first = ThreadId.make("stop-one");
+          const second = ThreadId.make("stop-all");
+          yield* adapter.startSession(startInput(first, ProviderInstanceId.make("copilot")));
+          yield* adapter.startSession(startInput(second, ProviderInstanceId.make("copilot")));
+          const stoppedTurn = yield* Deferred.make<unknown>();
+          yield* Stream.runForEach(adapter.streamEvents, (runtimeEvent) =>
+            runtimeEvent.type === "turn.completed" && runtimeEvent.payload.state === "cancelled"
+              ? Deferred.succeed(stoppedTurn, runtimeEvent.payload)
+              : Effect.void,
+          ).pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          yield* adapter.sendTurn({ threadId: first, input: "Keep working" });
+          yield* adapter.stopSession(first);
+          yield* Deferred.await(stoppedTurn);
+          assert.isFalse(yield* adapter.hasSession(first));
+          assert.isTrue(yield* adapter.hasSession(second));
+          assert.equal(disconnects, 1);
+        }),
+      );
+
+      assert.equal(disconnects, 2);
+      assert.equal(runtimeReleases, 1);
     }),
   );
 });
