@@ -2,7 +2,10 @@ import {
   CopilotClient,
   RuntimeConnection,
   type GetAuthStatusResponse,
+  type MessageOptions,
   type ModelInfo,
+  type SessionConfig,
+  type SessionEvent,
 } from "@github/copilot-sdk";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -106,6 +109,39 @@ async function stopClient(client: CopilotClient): Promise<void> {
 export interface CopilotSdkConnection {
   readonly authStatus: Effect.Effect<GetAuthStatusResponse, CopilotSdkRuntimeError>;
   readonly models: Effect.Effect<ReadonlyArray<ModelInfo>, CopilotSdkRuntimeError>;
+  readonly createSession: (
+    input: CopilotSdkSessionStartInput,
+  ) => Effect.Effect<CopilotSdkSession, CopilotSdkRuntimeError>;
+}
+
+export interface CopilotSdkSessionStartInput {
+  readonly workingDirectory: string;
+  readonly model?: string;
+  readonly onEvent: (event: SessionEvent) => void;
+}
+
+export interface CopilotSdkSession {
+  readonly sessionId: string;
+  readonly send: (input: MessageOptions) => Effect.Effect<string, CopilotSdkRuntimeError>;
+  readonly disconnect: Effect.Effect<void, CopilotSdkRuntimeError>;
+}
+
+function wrapSession(
+  session: Awaited<ReturnType<CopilotClient["createSession"]>>,
+): CopilotSdkSession {
+  return {
+    sessionId: session.sessionId,
+    send: (input) => sdkEffect("send", () => session.send(input)),
+    disconnect: sdkEffect("disconnect", () => session.disconnect()),
+  };
+}
+
+function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig {
+  return {
+    workingDirectory: input.workingDirectory,
+    ...(input.model ? { model: input.model } : {}),
+    onEvent: input.onEvent,
+  };
 }
 
 export interface CopilotSdkRuntimeShape {
@@ -164,6 +200,10 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
     return {
       authStatus: sdkEffect("getAuthStatus", () => client.getAuthStatus()),
       models: sdkEffect("listModels", () => client.listModels()),
+      createSession: (input) =>
+        sdkEffect("createSession", () => client.createSession(sessionConfig(input))).pipe(
+          Effect.map(wrapSession),
+        ),
     };
   }),
 };

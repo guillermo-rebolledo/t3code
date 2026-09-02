@@ -22,7 +22,7 @@ import {
 const PRESENTATION = {
   displayName: "GitHub Copilot",
   showInteractionModeToggle: true,
-  supportsThreadExecution: false,
+  supportsThreadExecution: true,
 } as const;
 const VERSION_TIMEOUT = "8 seconds";
 const SDK_TIMEOUT = "10 seconds";
