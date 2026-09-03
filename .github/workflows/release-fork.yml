@@ -265,13 +265,60 @@ jobs:
           $installPath = & $vswhere -products * -latest -property installationPath
           $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
           $proc = Start-Process -FilePath $setupExe `
-            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre", "--quiet", "--norestart" `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", `
+            "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", `
+            "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre", `
+            "--quiet", "--norestart" `
             -Wait -PassThru -NoNewWindow
           if ($null -eq $proc -or $proc.ExitCode -ne 0) {
             $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
             Write-Error "Visual Studio Installer failed with exit code $code"
             exit $code
+          }
+
+      # The installer can exit 0 without applying a component (it logs "Didn't
+      # find any channel feed" on hosted images). Mirror the probe from
+      # windowsVswherePrerequisiteScript() in scripts/build-desktop-artifact.ts
+      # so a missing piece is named here instead of surfacing as an opaque
+      # "prerequisites are missing" failure minutes later.
+      - name: Verify Windows build prerequisites
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $missing = @()
+
+          Write-Host "VS install: $(& $vswhere -latest -products * -property installationPath)"
+          Write-Host "VS version: $(& $vswhere -latest -products * -property installationVersion)"
+
+          foreach ($component in @(
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre"
+          )) {
+            $found = & $vswhere -latest -products * -requires $component -property installationPath
+            if ($found) {
+              Write-Host "OK       $component"
+            } else {
+              Write-Host "MISSING  $component"
+              $missing += $component
+            }
+          }
+
+          $kitsRoot = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10 -ErrorAction SilentlyContinue
+          if ($kitsRoot -and (Test-Path (Join-Path $kitsRoot 'Lib'))) {
+            Write-Host "OK       Windows SDK ($kitsRoot)"
+          } else {
+            Write-Host "MISSING  Windows SDK (KitsRoot10='$kitsRoot')"
+            $missing += "Windows SDK"
+          }
+
+          Write-Host "Installed VC component directories:"
+          $vcRoot = Join-Path (& $vswhere -latest -products * -property installationPath) 'VC\Tools\MSVC'
+          if (Test-Path $vcRoot) { Get-ChildItem $vcRoot | ForEach-Object { Write-Host "  $($_.Name)" } }
+
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing Windows build prerequisites: $($missing -join ', ')"
+            exit 1
           }
 
       - name: Install ImageMagick
