@@ -91,7 +91,7 @@ to use, then authenticate it.
 | Cursor         | [Cursor CLI](https://cursor.com/cli)                                              | `cursor-agent` | `agent login`         |
 | Grok Build     | [Grok Build CLI](https://x.ai/cli)                                                | `grok`         | `grok login`          |
 | OpenCode       | [OpenCode](https://opencode.ai)                                                   | `opencode`     | `opencode auth login` |
-| GitHub Copilot | [Copilot CLI](https://docs.github.com/copilot/how-tos/set-up/install-copilot-cli) | `copilot`      | `copilot auth login`  |
+| GitHub Copilot | [Copilot CLI](https://docs.github.com/copilot/how-tos/set-up/install-copilot-cli) | `copilot`      | `copilot login`       |
 
 Codex and Claude are on by default. Cursor, Grok Build, and OpenCode are off by default. GitHub
 Copilot is added explicitly from **Settings** → **Providers**; upgrading T3 Code does not create a

@@ -25,6 +25,8 @@ import { ProviderAdapterRequestError, ProviderDriverError } from "../Errors.ts";
 import {
   buildInitialCopilotProviderSnapshot,
   checkCopilotProviderStatus,
+  copilotCliCompatibilityIssue,
+  inspectCopilotCliVersion,
 } from "../CopilotProvider.ts";
 import { makeCopilotAdapter } from "../Layers/CopilotAdapter.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
@@ -133,6 +135,17 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies CopilotSettings;
+      if (enabled) {
+        const cliVersion = yield* inspectCopilotCliVersion(effectiveConfig.binaryPath, processEnv);
+        const compatibilityIssue = copilotCliCompatibilityIssue(cliVersion);
+        if (compatibilityIssue) {
+          return yield* new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: compatibilityIssue,
+          });
+        }
+      }
       // The instance's one SDK connection serves its adapter, auxiliary text
       // generation, and per-workspace capability reads, so none of those paths
       // starts a second Copilot process behind the running one.

@@ -4,16 +4,23 @@ T3 Code uses the GitHub Copilot CLI installed on the connected environment. It d
 CLI or store its credentials. With a remote environment, install and authenticate Copilot on the
 server machine, not on the browser or phone controlling it.
 
-Install the Copilot CLI and sign in:
+## Install and connect
+
+Install the stable [Copilot CLI](https://docs.github.com/copilot/how-tos/set-up/install-copilot-cli)
+on the environment machine, then sign in from a standalone terminal there:
 
 ```sh
-copilot auth login
+copilot login
 ```
 
 Then open **Settings** → **Providers**, add **GitHub Copilot**, and optionally set **Binary path**.
 Use an explicit path if a packaged desktop launch cannot see the same `PATH` as your shell. T3 Code
 also checks common Homebrew and user-level install directories and respects provider-specific
 environment variables and Windows executable extensions.
+
+Copilot CLI 1.0.79 or newer is required. Run `copilot version` to see the installed version and
+`copilot update stable` to update it. T3 Code reports an older CLI as incompatible before it opens a
+session, with the minimum version in the error.
 
 Provider status distinguishes a missing executable, invalid version output, CLI failure, SDK
 timeout, signed-out account, organization-policy or entitlement rejection, and a ready account. A
@@ -23,6 +30,17 @@ the last successful list; T3 Code never adds a made-up Copilot model.
 Multiple Copilot provider instances may use different executable paths or environments. Unless that
 configuration changes where Copilot stores its state, the instances share the operating-system
 Copilot credential store.
+
+For a work or organization-managed account, complete `copilot login` with that account and ask its
+administrator to enable Copilot CLI if provider status reports an organization-policy or entitlement
+failure. T3 Code cannot bypass account policy. It lists only the models that the signed-in account
+can use, and it reports unavailable models or unsupported model options instead of substituting a
+different choice.
+
+The environment always owns the Copilot process, executable, sessions, and credentials. This stays
+the same when a browser, packaged desktop app, or mobile app connects locally, directly over the
+network, through a relay, or through a T3 Connect tunnel. The controlling client does not need a
+Copilot installation or credentials.
 
 An enabled, ready Copilot instance can also generate thread titles, branch names, commit messages,
 and pull-request copy. These background requests use the model and supported options selected for
@@ -68,3 +86,17 @@ Changing the model or a model option, such as reasoning effort or context window
 running Copilot session and takes effect on your next message; the conversation is not restarted. A
 model your account cannot use, or an option a model does not offer, is reported instead of quietly
 falling back to a different one.
+
+## Troubleshooting
+
+- **CLI not found:** run `copilot version` on the environment machine. If that works only in an
+  interactive shell, set the provider's **Binary path** to the absolute executable path.
+- **CLI too old:** run `copilot update stable`, restart the environment, and check provider status
+  again.
+- **Signed out:** run `copilot login` in a standalone terminal on the environment machine. Packaged
+  desktop launches use the same operating-system credential store; do not paste credentials into T3
+  Code.
+- **Account or model rejected:** confirm the work-account policy and model entitlement with the
+  organization administrator. The model list in T3 Code is the account's live Copilot inventory.
+- **A turn will not finish:** stop it from the thread. If the Copilot process exited, the thread shows
+  the failure and can continue after the provider is healthy again.

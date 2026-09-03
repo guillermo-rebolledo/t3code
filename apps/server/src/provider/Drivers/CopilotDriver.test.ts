@@ -5,7 +5,9 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
@@ -20,6 +22,26 @@ import { NoOpProviderEventLoggers, ProviderEventLoggers } from "../Layers/Provid
 import { CopilotDriver } from "./CopilotDriver.ts";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
+const encoder = new TextEncoder();
+
+const versionSpawner = (version: string) =>
+  ChildProcessSpawner.make(() =>
+    Effect.succeed(
+      ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(1),
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+        isRunning: Effect.succeed(false),
+        kill: () => Effect.void,
+        unref: Effect.succeed(Effect.void),
+        stdin: Sink.drain,
+        stdout: Stream.make(encoder.encode(`GitHub Copilot CLI ${version}\n`)),
+        stderr: Stream.empty,
+        all: Stream.empty,
+        getInputFd: () => Sink.drain,
+        getOutputFd: () => Stream.empty,
+      }),
+    ),
+  );
 
 const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
   reportClientActivity: () => Effect.void,
@@ -137,6 +159,33 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
 );
 
 it.layer(testLayer)("CopilotDriver workspace snapshots", (it) => {
+  it.effect("rejects an incompatible CLI before starting the SDK runtime", () =>
+    Effect.gen(function* () {
+      const starts: number[] = [];
+      const incompatibleRuntime: CopilotSdkRuntimeShape = {
+        ...runtime,
+        connect: (input) =>
+          Effect.sync(() => starts.push(1)).pipe(Effect.andThen(runtime.connect(input))),
+      };
+
+      const error = yield* CopilotDriver.create({
+        instanceId: ProviderInstanceId.make("copilot_old"),
+        displayName: "Old Copilot",
+        environment: [],
+        enabled: true,
+        config: { enabled: true, binaryPath: "copilot" },
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, versionSpawner("1.0.78")),
+        Effect.provideService(CopilotSdkRuntime, incompatibleRuntime),
+        Effect.flip,
+      );
+
+      assert.include(error.detail, "v1.0.78 is too old");
+      assert.include(error.detail, "v1.0.79 or newer");
+      assert.isEmpty(starts);
+    }),
+  );
+
   it.effect("scopes commands and skills to their working directory", () =>
     Effect.gen(function* () {
       const instance = yield* CopilotDriver.create({
@@ -144,11 +193,10 @@ it.layer(testLayer)("CopilotDriver workspace snapshots", (it) => {
         displayName: "Copilot Work",
         environment: [],
         enabled: true,
-        // A path that cannot resolve keeps the background health probe from
-        // reaching a real Copilot CLI; the snapshot under test is the initial
-        // one either way.
-        config: { enabled: true, binaryPath: "/nonexistent/copilot" },
-      });
+        config: { enabled: true, binaryPath: "copilot" },
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, versionSpawner("1.0.80")),
+      );
 
       const machineSnapshot = yield* instance.snapshot.getSnapshot;
       const app = yield* instance.snapshotForCwd!("/repo/app");
@@ -182,8 +230,10 @@ it.layer(testLayer)("CopilotDriver workspace snapshots", (it) => {
         displayName: "Copilot Work",
         environment: [],
         enabled: true,
-        config: { enabled: true, binaryPath: "/nonexistent/copilot" },
-      });
+        config: { enabled: true, binaryPath: "copilot" },
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, versionSpawner("1.0.80")),
+      );
 
       const generated = yield* instance.textGeneration.generateThreadTitle({
         cwd: "/repo/app",

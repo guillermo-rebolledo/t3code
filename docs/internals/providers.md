@@ -52,12 +52,23 @@ launches the user's separately installed `copilot` executable over the stable fi
 `@github/copilot-sdk` stdio transport. The CLI continues to own credentials in the operating-system
 keychain or supported environment variables; T3 Code does not copy or persist them.
 
+The compatibility baseline is Copilot CLI 1.0.79 or newer, matching the oldest runtime declared by
+the pinned `@github/copilot-sdk` 1.0.11. The release-hardening pass tested CLI 1.0.82 with SDK 1.0.11.
+Provider discovery rejects an older CLI before starting the SDK and returns an upgrade instruction;
+runtime features never silently degrade around a missing protocol capability. Update this paragraph,
+the minimum-version constant, and the focused provider test together when the SDK is upgraded.
+
 The `CopilotSdkRuntime` service is the single test injection seam for SDK startup, cleanup,
 authentication, status, models, sessions, failures, and timeouts. Production resolves bare
 executable names against the provider-instance environment, Windows `PATHEXT`, and conservative GUI
 install paths before opening stdio. A successful account inventory is authoritative and its first
 entry is the live preferred default. Failed refreshes retain the last successful catalog, and no
 static model is invented.
+
+The server environment owns this process and its credential lookup in every connection mode. Web
+and desktop clients, direct remote clients, relay clients, and tunnel-connected mobile clients send
+the same typed requests to that server-owned instance; no client-side Copilot binary, token, or
+session is part of the provider contract.
 
 Each enabled provider instance owns one scoped SDK client and its own map of T3 thread ids to SDK
 sessions. The Copilot adapter maps SDK assistant, reasoning, tool, usage, and idle events onto

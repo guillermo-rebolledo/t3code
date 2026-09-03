@@ -15,7 +15,9 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
@@ -33,6 +35,25 @@ import { CopilotDriver } from "./CopilotDriver.ts";
 
 const COPILOT = ProviderDriverKind.make("copilot");
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
+const encoder = new TextEncoder();
+
+const versionSpawner = ChildProcessSpawner.make(() =>
+  Effect.succeed(
+    ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(1),
+      exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+      isRunning: Effect.succeed(false),
+      kill: () => Effect.void,
+      unref: Effect.succeed(Effect.void),
+      stdin: Sink.drain,
+      stdout: Stream.make(encoder.encode("GitHub Copilot CLI 1.0.80\n")),
+      stderr: Stream.empty,
+      all: Stream.empty,
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+    }),
+  ),
+);
 
 const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
   reportClientActivity: () => Effect.void,
@@ -165,7 +186,11 @@ const baseLayer = ServerConfig.layerTest(process.cwd(), {
 );
 
 const testLayer = (runtime: CopilotSdkRuntimeShape) =>
-  baseLayer.pipe(Layer.provideMerge(Layer.succeed(CopilotSdkRuntime, runtime)));
+  Layer.mergeAll(
+    baseLayer,
+    Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, versionSpawner),
+    Layer.succeed(CopilotSdkRuntime, runtime),
+  );
 
 function connectionFor(
   connections: ReadonlyArray<TrackedConnection>,
