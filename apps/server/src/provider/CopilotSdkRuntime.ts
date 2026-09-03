@@ -71,16 +71,41 @@ function detailFromCause(cause: unknown): string {
   return cause instanceof Error && cause.message.trim() ? cause.message.trim() : String(cause);
 }
 
-function sdkEffect<A>(operation: string, run: () => Promise<A>) {
-  return Effect.tryPromise({
-    try: run,
-    catch: (cause) =>
-      new CopilotSdkRuntimeError({
-        operation,
-        kind: "failure",
-        detail: detailFromCause(cause),
-        cause,
-      }),
+/** Wrap an SDK promise so callers can interrupt the wait and dispose a value that arrives late. */
+export function interruptibleSdkEffect<A>(
+  operation: string,
+  run: () => Promise<A>,
+  onLateSuccess?: (value: A) => Promise<void>,
+) {
+  return Effect.callback<A, CopilotSdkRuntimeError>((resume) => {
+    let interrupted = false;
+    void Promise.resolve()
+      .then(run)
+      .then(
+        (value) => {
+          if (interrupted) {
+            void onLateSuccess?.(value).catch(() => undefined);
+            return;
+          }
+          resume(Effect.succeed(value));
+        },
+        (cause) => {
+          if (interrupted) return;
+          resume(
+            Effect.fail(
+              new CopilotSdkRuntimeError({
+                operation,
+                kind: "failure",
+                detail: detailFromCause(cause),
+                cause,
+              }),
+            ),
+          );
+        },
+      );
+    return Effect.sync(() => {
+      interrupted = true;
+    });
   });
 }
 
@@ -181,6 +206,8 @@ export interface CopilotSdkModelOptions {
 export interface CopilotSdkSessionStartInput {
   readonly workingDirectory: string;
   readonly modelOptions?: CopilotSdkModelOptions;
+  /** Restricts the runtime's built-in and discovered tool catalog for this session. */
+  readonly availableTools?: SessionConfigBase["availableTools"];
   readonly onEvent: (event: SessionEvent) => void;
   readonly onPermissionRequest: (request: unknown) => Promise<PermissionRequestResult>;
 }
@@ -234,16 +261,20 @@ function wrapSession(
 ): CopilotSdkSession {
   return {
     sessionId: session.sessionId,
-    send: (input) => sdkEffect("send", () => session.send(input)),
-    abort: sdkEffect("abort", () => session.abort()).pipe(Effect.asVoid),
+    send: (input) => interruptibleSdkEffect("send", () => session.send(input)),
+    abort: interruptibleSdkEffect("abort", () => session.abort()).pipe(Effect.asVoid),
     setModel: (options) =>
-      sdkEffect("setModel", () => session.setModel(options.model, modelSettings(options))),
-    listCommands: sdkEffect("listCommands", () =>
+      interruptibleSdkEffect("setModel", () =>
+        session.setModel(options.model, modelSettings(options)),
+      ),
+    listCommands: interruptibleSdkEffect("listCommands", () =>
       session.rpc.commands.list(ROUTABLE_COMMAND_FILTERS),
     ).pipe(Effect.map((result) => result.commands)),
     invokeCommand: (input) =>
-      sdkEffect("invokeCommand", () => session.rpc.commands.invoke({ ...input })),
-    rewindPoints: sdkEffect("listRewindPoints", () => session.rpc.history.listRewindPoints()).pipe(
+      interruptibleSdkEffect("invokeCommand", () => session.rpc.commands.invoke({ ...input })),
+    rewindPoints: interruptibleSdkEffect("listRewindPoints", () =>
+      session.rpc.history.listRewindPoints(),
+    ).pipe(
       Effect.map((result) => ({
         // Autopilot continuations are turns the runtime injected on its own;
         // they are not turns a user took, so counting them would shift every
@@ -261,8 +292,10 @@ function wrapSession(
     // Conversation-only: T3 owns workspace restore through its own checkpoints,
     // so the runtime must never touch files behind our back.
     rewind: (eventId) =>
-      sdkEffect("rewind", () => session.rpc.history.rewind({ eventId, mode: "conversation" })),
-    disconnect: sdkEffect("disconnect", () => session.disconnect()),
+      interruptibleSdkEffect("rewind", () =>
+        session.rpc.history.rewind({ eventId, mode: "conversation" }),
+      ),
+    disconnect: interruptibleSdkEffect("disconnect", () => session.disconnect()),
   };
 }
 
@@ -282,6 +315,7 @@ function sessionConfig(input: CopilotSdkSessionStartInput): SessionConfig & Resu
     ...(input.modelOptions
       ? { model: input.modelOptions.model, ...modelSettings(input.modelOptions) }
       : {}),
+    ...(input.availableTools ? { availableTools: input.availableTools } : {}),
     streaming: true,
     onEvent: input.onEvent,
     onPermissionRequest: (request: PermissionRequest) => input.onPermissionRequest(request),
@@ -342,18 +376,20 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
       Effect.promise(() => stopClient(client)).pipe(Effect.asVoid),
     );
     return {
-      authStatus: sdkEffect("getAuthStatus", () => client.getAuthStatus()),
-      models: sdkEffect("listModels", () => client.listModels()),
+      authStatus: interruptibleSdkEffect("getAuthStatus", () => client.getAuthStatus()),
+      models: interruptibleSdkEffect("listModels", () => client.listModels()),
       createSession: (input) =>
-        sdkEffect("createSession", () => client.createSession(sessionConfig(input))).pipe(
-          Effect.map(wrapSession),
-        ),
+        interruptibleSdkEffect(
+          "createSession",
+          () => client.createSession(sessionConfig(input)),
+          (session) => session.disconnect(),
+        ).pipe(Effect.map(wrapSession)),
       resumeSession: (input) =>
-        sdkEffect("resumeSession", () =>
+        interruptibleSdkEffect("resumeSession", () =>
           client.resumeSession(input.sessionId, sessionConfig(input)),
         ).pipe(Effect.map(wrapSession)),
       workspaceCommands: (cwd) =>
-        sdkEffect("workspaceCommands", async () => {
+        interruptibleSdkEffect("workspaceCommands", async () => {
           const session = await client.createSession({
             workingDirectory: cwd,
             enableConfigDiscovery: true,
@@ -370,7 +406,7 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
           }
         }),
       workspaceSkills: (cwd) =>
-        sdkEffect("workspaceSkills", () =>
+        interruptibleSdkEffect("workspaceSkills", () =>
           client.rpc.skills.discover({ projectPaths: [cwd] }),
         ).pipe(Effect.map((result) => result.skills)),
     };

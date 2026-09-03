@@ -24,6 +24,11 @@ Multiple Copilot provider instances may use different executable paths or enviro
 configuration changes where Copilot stores its state, the instances share the operating-system
 Copilot credential store.
 
+An enabled, ready Copilot instance can also generate thread titles, branch names, commit messages,
+and pull-request copy. These background requests use the model and supported options selected for
+that workflow. They run in a temporary session with no tools available; every permission request is
+rejected, and the session is disconnected when the request succeeds, fails, or times out.
+
 Copilot-backed threads support ordinary prompts, uploaded images and files, streaming assistant and
 reasoning output, tool progress, usage updates, and stopping. Stopping a running turn takes effect
 immediately and leaves the thread ready for the next message. If Copilot reports an error or its
