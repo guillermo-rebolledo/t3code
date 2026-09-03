@@ -77,6 +77,8 @@ interface CopilotTurnState {
 }
 
 interface CopilotSessionContext {
+  /** Unique owner token used to reject callbacks from a replaced SDK session. */
+  readonly sessionOwnerToken: object;
   session: ProviderSession;
   readonly sdk: CopilotSdkSession;
   /** Canonical form of the selection already applied, so an unchanged one is free. */
@@ -106,12 +108,19 @@ interface PendingApproval {
   readonly resolve: (decision: ProviderApprovalDecision) => void;
 }
 
+interface PendingSessionStart {
+  readonly token: object;
+  readonly cancelled: Deferred.Deferred<void>;
+  readonly completed: Deferred.Deferred<void>;
+}
+
 /**
  * Queue payload for the single ordered consumer of native SDK events. Each item
  * carries the turn that was live when the runtime emitted it.
  */
 interface CopilotNativeItem {
   readonly threadId: ThreadId;
+  readonly sessionOwnerToken: object;
   readonly event: SessionEvent;
   readonly turn: CopilotTurnState | undefined;
 }
@@ -178,6 +187,10 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
   const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nativeEvents = yield* Queue.unbounded<CopilotNativeItem>();
   const sessions = new Map<ThreadId, CopilotSessionContext>();
+  const pendingStarts = new Set<PendingSessionStart>();
+  const latestStartByThread = new Map<ThreadId, PendingSessionStart>();
+  let stopAllCompletion: Deferred.Deferred<void> | undefined;
+  let lifecycleGeneration = 0;
   const nextId = crypto.randomUUIDv4.pipe(
     Effect.map((id) => EventId.make(id)),
     Effect.orDie,
@@ -200,9 +213,11 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
 
   const handlePermissionRequest = Effect.fn("CopilotAdapter.handlePermissionRequest")(function* (
     threadId: ThreadId,
+    sessionOwnerToken: object,
     payload: unknown,
   ) {
     const context = sessions.get(threadId);
+    if (context?.sessionOwnerToken !== sessionOwnerToken) return { kind: "reject" } as const;
     const permission = parseCopilotPermission(payload);
     if (!context || context.stopped || !permission) {
       const base = yield* baseEvent(threadId, context?.activeTurn?.id);
@@ -537,12 +552,13 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
 
   const handleEvent = Effect.fn("CopilotAdapter.handleEvent")(function* (
     threadId: ThreadId,
+    sessionOwnerToken: object,
     event: SessionEvent,
     observedTurn: CopilotTurnState | undefined,
   ) {
     yield* logNative(threadId, event).pipe(Effect.ignore);
     const context = sessions.get(threadId);
-    if (!context || context.stopped) return;
+    if (!context || context.stopped || context.sessionOwnerToken !== sessionOwnerToken) return;
     // The aborted idle for a turn T3 already settled is dropped outright: it is
     // the one late event that would otherwise complete a newer turn.
     if (
@@ -790,8 +806,12 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
       }
     }
   });
-  yield* Stream.runForEach(Stream.fromQueue(nativeEvents), ({ threadId, event, turn }) =>
-    handleEvent(threadId, event, turn).pipe(Effect.catchCause(Effect.logError)),
+  yield* Stream.runForEach(
+    Stream.fromQueue(nativeEvents),
+    ({ threadId, sessionOwnerToken, event, turn }) =>
+      handleEvent(threadId, sessionOwnerToken, event, turn).pipe(
+        Effect.catchCause(Effect.logError),
+      ),
   ).pipe(Effect.forkScoped);
 
   const stopSessionInternal = Effect.fn("CopilotAdapter.stopSessionInternal")(function* (
@@ -883,97 +903,163 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
         issue: "cwd is required and must be non-empty.",
       });
     }
-    // Unusable continuation state is rejected before any session is torn down,
-    // so a thread whose cursor T3 cannot read keeps the session it still has.
-    // A cursor the runtime itself refuses is a different story: that failure
-    // surfaces below, after the previous session has already been released.
-    const continuation = resolveCopilotContinuation(input.resumeCursor, instanceId);
-    if (continuation.kind === "invalid") {
-      return yield* new ProviderAdapterValidationError({
+    const cwd = input.cwd.trim();
+    const startCancelled = yield* Deferred.make<void>();
+    const startCompleted = yield* Deferred.make<void>();
+    if (stopAllCompletion) {
+      return yield* new ProviderAdapterRequestError({
         provider: PROVIDER,
-        operation: "startSession",
-        issue: continuation.issue,
+        method: "startSession",
+        detail: "GitHub Copilot sessions are currently stopping.",
       });
     }
-    const modelOptions = yield* resolveModelOptions("startSession", input.modelSelection);
-
-    const existing = sessions.get(input.threadId);
-    if (existing) yield* stopSessionInternal(existing, false);
-
-    const threadId = input.threadId;
-    const onEvent = (event: SessionEvent) => {
-      Queue.offerUnsafe(nativeEvents, {
-        threadId,
-        event,
-        turn: sessions.get(threadId)?.activeTurn,
+    const startGeneration = lifecycleGeneration;
+    const startToken = {};
+    const pendingStart: PendingSessionStart = {
+      token: startToken,
+      cancelled: startCancelled,
+      completed: startCompleted,
+    };
+    const previousStart = latestStartByThread.get(input.threadId);
+    pendingStarts.add(pendingStart);
+    latestStartByThread.set(input.threadId, pendingStart);
+    if (previousStart) yield* Deferred.succeed(previousStart.cancelled, undefined);
+    const clearPendingStart = Effect.sync(() => {
+      pendingStarts.delete(pendingStart);
+      if (latestStartByThread.get(input.threadId)?.token === startToken) {
+        latestStartByThread.delete(input.threadId);
+      }
+    }).pipe(Effect.andThen(Deferred.succeed(startCompleted, undefined)));
+    const isCurrentStart = () =>
+      lifecycleGeneration === startGeneration &&
+      latestStartByThread.get(input.threadId)?.token === startToken;
+    const supersededStartError = () =>
+      new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "startSession",
+        detail: "The GitHub Copilot session start was superseded or stopped before it completed.",
       });
-    };
-    const sdkInput = {
-      workingDirectory: input.cwd.trim(),
-      ...(modelOptions ? { modelOptions } : {}),
-      onEvent,
-      onPermissionRequest: (payload: unknown) =>
-        runPromise(handlePermissionRequest(threadId, payload)),
-    };
-    const sdk = yield* continuation.kind === "resume"
-      ? connection
-          .resumeSession({ ...sdkInput, sessionId: continuation.sessionId })
-          .pipe(Effect.mapError((error) => mapSdkError("resumeSession", error)))
-      : connection
-          .createSession(sdkInput)
-          .pipe(Effect.mapError((error) => mapSdkError("createSession", error)));
-    // A runtime that will not - or will not promptly - list its commands costs
-    // the user command routing for this session, never the session itself.
-    const commandNames = yield* sdk.listCommands.pipe(
-      Effect.map((commands) => copilotSlashCommandNames(mapCopilotSlashCommands(commands))),
-      Effect.timeout(COMMAND_DISCOVERY_TIMEOUT),
-      Effect.catchCause((cause) =>
-        Cause.hasInterrupts(cause)
-          ? Effect.interrupt
-          : Effect.logWarning("GitHub Copilot slash command discovery failed.", {
-              cause: Cause.pretty(cause),
-            }).pipe(Effect.as(new Set<string>() as ReadonlySet<string>)),
-      ),
+    const cancelledStart = Deferred.await(startCancelled).pipe(
+      Effect.andThen(Effect.suspend(supersededStartError)),
     );
-    const createdAt = yield* nowIso;
-    const session: ProviderSession = {
-      provider: PROVIDER,
-      providerInstanceId: instanceId,
-      status: "ready",
-      runtimeMode: input.runtimeMode,
-      cwd: input.cwd.trim(),
-      ...(modelOptions ? { model: modelOptions.model } : {}),
-      threadId,
-      resumeCursor: buildCopilotContinuation({ instanceId, sessionId: sdk.sessionId }),
-      createdAt,
-      updatedAt: createdAt,
-    };
-    sessions.set(threadId, {
-      session,
-      sdk,
-      appliedModelKey: modelSelectionKey(input.modelSelection, instanceId),
-      commandNames,
-      turns: [],
-      pendingApprovals: new Map(),
-      deniedToolCallIds: new Set(),
-      activeTurn: undefined,
-      awaitingAbortedIdle: false,
-      terminated: yield* Deferred.make<void>(),
-      stopped: false,
-    });
-    const sessionBase = yield* baseEvent(threadId);
-    yield* emit({
-      ...sessionBase,
-      type: "session.started",
-      payload: {},
-    });
-    const threadBase = yield* baseEvent(threadId);
-    yield* emit({
-      ...threadBase,
-      type: "thread.started",
-      payload: { providerThreadId: sdk.sessionId },
-    });
-    return session;
+
+    return yield* Effect.gen(function* () {
+      // Unusable continuation state is rejected before any session is torn down,
+      // so a thread whose cursor T3 cannot read keeps the session it still has.
+      // A cursor the runtime itself refuses is a different story: that failure
+      // surfaces below, after the previous session has already been released.
+      const continuation = resolveCopilotContinuation(input.resumeCursor, instanceId);
+      if (continuation.kind === "invalid") {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: continuation.issue,
+        });
+      }
+      const modelOptions = yield* resolveModelOptions("startSession", input.modelSelection);
+
+      const existing = sessions.get(input.threadId);
+      if (existing) yield* stopSessionInternal(existing, false);
+
+      const threadId = input.threadId;
+      const sessionOwnerToken = {};
+      const onEvent = (event: SessionEvent) => {
+        const context = sessions.get(threadId);
+        Queue.offerUnsafe(nativeEvents, {
+          threadId,
+          sessionOwnerToken,
+          event,
+          turn: context?.sessionOwnerToken === sessionOwnerToken ? context.activeTurn : undefined,
+        });
+      };
+      const sdkInput = {
+        workingDirectory: cwd,
+        ...(modelOptions ? { modelOptions } : {}),
+        onEvent,
+        onPermissionRequest: (payload: unknown) =>
+          runPromise(handlePermissionRequest(threadId, sessionOwnerToken, payload)),
+      };
+      const sdk = yield* (
+        continuation.kind === "resume"
+          ? connection
+              .resumeSession({ ...sdkInput, sessionId: continuation.sessionId })
+              .pipe(Effect.mapError((error) => mapSdkError("resumeSession", error)))
+          : connection
+              .createSession(sdkInput)
+              .pipe(Effect.mapError((error) => mapSdkError("createSession", error)))
+      ).pipe(Effect.raceFirst(cancelledStart));
+      return yield* Effect.gen(function* () {
+        // A runtime that will not - or will not promptly - list its commands costs
+        // the user command routing for this session, never the session itself.
+        const commandNames = yield* sdk.listCommands.pipe(
+          Effect.map((commands) => copilotSlashCommandNames(mapCopilotSlashCommands(commands))),
+          Effect.timeout(COMMAND_DISCOVERY_TIMEOUT),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("GitHub Copilot slash command discovery failed.", {
+                  cause: Cause.pretty(cause),
+                }).pipe(Effect.as(new Set<string>() as ReadonlySet<string>)),
+          ),
+        );
+        const createdAt = yield* nowIso;
+        const terminated = yield* Deferred.make<void>();
+        const session: ProviderSession = {
+          provider: PROVIDER,
+          providerInstanceId: instanceId,
+          status: "ready",
+          runtimeMode: input.runtimeMode,
+          cwd,
+          ...(modelOptions ? { model: modelOptions.model } : {}),
+          threadId,
+          resumeCursor: buildCopilotContinuation({ instanceId, sessionId: sdk.sessionId }),
+          createdAt,
+          updatedAt: createdAt,
+        };
+        if (!isCurrentStart()) {
+          yield* sdk.disconnect.pipe(Effect.ignore);
+          return yield* supersededStartError();
+        }
+        sessions.set(threadId, {
+          sessionOwnerToken,
+          session,
+          sdk,
+          appliedModelKey: modelSelectionKey(input.modelSelection, instanceId),
+          commandNames,
+          turns: [],
+          pendingApprovals: new Map(),
+          deniedToolCallIds: new Set(),
+          activeTurn: undefined,
+          awaitingAbortedIdle: false,
+          terminated,
+          stopped: false,
+        });
+        const sessionBase = yield* baseEvent(threadId);
+        yield* emit({
+          ...sessionBase,
+          type: "session.started",
+          payload: {},
+        });
+        const threadBase = yield* baseEvent(threadId);
+        yield* emit({
+          ...threadBase,
+          type: "thread.started",
+          payload: { providerThreadId: sdk.sessionId },
+        });
+        if (!isCurrentStart() || sessions.get(threadId)?.sdk !== sdk) {
+          return yield* supersededStartError();
+        }
+        return session;
+      }).pipe(
+        Effect.onInterrupt(() => {
+          const context = sessions.get(threadId);
+          return context?.sdk === sdk
+            ? stopSessionInternal(context, false).pipe(Effect.ignore)
+            : sdk.disconnect.pipe(Effect.ignore);
+        }),
+        Effect.raceFirst(cancelledStart),
+      );
+    }).pipe(Effect.ensuring(clearPendingStart));
   });
 
   const sendTurn = Effect.fn("CopilotAdapter.sendTurn")(function* (input: ProviderSendTurnInput) {
@@ -1164,11 +1250,30 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
     );
 
   const stopAll = Effect.fn("CopilotAdapter.stopAll")(function* () {
-    const results = yield* Effect.forEach(Array.from(sessions.values()), (context) =>
-      stopSessionInternal(context, false).pipe(Effect.result),
+    if (stopAllCompletion) return yield* Deferred.await(stopAllCompletion);
+    const completion = yield* Deferred.make<void>();
+    stopAllCompletion = completion;
+    return yield* Effect.gen(function* () {
+      lifecycleGeneration += 1;
+      const starts = Array.from(pendingStarts);
+      yield* Effect.forEach(starts, (pending) =>
+        Deferred.succeed(pending.cancelled, undefined),
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(starts, (pending) => Deferred.await(pending.completed)).pipe(
+        Effect.asVoid,
+      );
+      const results = yield* Effect.forEach(Array.from(sessions.values()), (context) =>
+        stopSessionInternal(context, false).pipe(Effect.result),
+      );
+      const failure = results.find((result) => result._tag === "Failure");
+      if (failure) return yield* failure.failure;
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (stopAllCompletion === completion) stopAllCompletion = undefined;
+        }).pipe(Effect.andThen(Deferred.succeed(completion, undefined))),
+      ),
     );
-    const failure = results.find((result) => result._tag === "Failure");
-    if (failure) return yield* failure.failure;
   });
 
   const adapter: ProviderAdapterShape<
@@ -1277,6 +1382,7 @@ export const makeCopilotAdapter = Effect.fn("makeCopilotAdapter")(function* (
   yield* Effect.addFinalizer(() =>
     adapter.stopAll().pipe(
       Effect.catch((error) => Effect.logWarning(errorDetail(error))),
+      Effect.andThen(Queue.shutdown(nativeEvents)),
       Effect.andThen(PubSub.shutdown(events)),
     ),
   );
