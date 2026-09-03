@@ -27,6 +27,7 @@ const RuntimeEventRawSource = Schema.Union([
   Schema.Literal("claude.sdk.permission"),
   Schema.Literal("copilot.sdk.event"),
   Schema.Literal("copilot.sdk.permission"),
+  Schema.Literal("copilot.sdk.command"),
   Schema.Literal("codex.sdk.thread-event"),
   Schema.Literal("opencode.sdk.event"),
   Schema.Literal("acp.jsonrpc"),

@@ -17,7 +17,11 @@ import {
   CopilotSdkRuntimeError,
   type CopilotSdkRuntimeShape,
 } from "./CopilotSdkRuntime.ts";
-import { checkCopilotProviderStatus, parseCopilotVersionOutput } from "./CopilotProvider.ts";
+import {
+  checkCopilotProviderStatus,
+  MINIMUM_COPILOT_CLI_VERSION,
+  parseCopilotVersionOutput,
+} from "./CopilotProvider.ts";
 
 const encoder = new TextEncoder();
 const settings = { enabled: true, binaryPath: "copilot" } as const;
@@ -60,6 +64,16 @@ function versionSpawner(result = { stdout: "GitHub Copilot CLI 1.0.80\n", stderr
   );
 }
 
+function unusedSession(operation: string) {
+  return Effect.fail(
+    new CopilotSdkRuntimeError({
+      operation,
+      kind: "failure",
+      detail: "not used by provider discovery tests",
+    }),
+  );
+}
+
 function runtimeLayer(input: {
   readonly auth?: Effect.Effect<GetAuthStatusResponse, CopilotSdkRuntimeError>;
   readonly models?: Effect.Effect<ReadonlyArray<ModelInfo>, CopilotSdkRuntimeError>;
@@ -76,14 +90,10 @@ function runtimeLayer(input: {
           return {
             authStatus: input.auth ?? Effect.succeed(authenticated),
             models: input.models ?? Effect.succeed(inventory),
-            createSession: () =>
-              Effect.fail(
-                new CopilotSdkRuntimeError({
-                  operation: "createSession",
-                  kind: "failure",
-                  detail: "not used by provider discovery tests",
-                }),
-              ),
+            createSession: () => unusedSession("createSession"),
+            resumeSession: () => unusedSession("resumeSession"),
+            workspaceCommands: () => unusedSession("workspaceCommands"),
+            workspaceSkills: () => unusedSession("workspaceSkills"),
           };
         }),
         () => Effect.sync(() => input.stops?.push(1)),
@@ -93,7 +103,7 @@ function runtimeLayer(input: {
 }
 
 const provide = (runtime: ReturnType<typeof runtimeLayer>) =>
-  Layer.mergeAll(runtime, versionSpawner(), NodeServices.layer);
+  Layer.mergeAll(NodeServices.layer, versionSpawner(), runtime);
 
 describe("parseCopilotVersionOutput", () => {
   it("distinguishes missing, failed, and unrecognized executables", () => {
@@ -110,6 +120,32 @@ describe("parseCopilotVersionOutput", () => {
 });
 
 describe("checkCopilotProviderStatus", () => {
+  it.effect("requires a CLI compatible with the pinned SDK before starting it", () =>
+    Effect.gen(function* () {
+      const starts: number[] = [];
+      const snapshot = yield* checkCopilotProviderStatus(settings, {}, {}).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            versionSpawner({
+              stdout: "GitHub Copilot CLI 1.0.78\n",
+              stderr: "",
+              code: 0,
+            }),
+            runtimeLayer({ starts }),
+          ),
+        ),
+      );
+
+      expect(snapshot.status).toBe("error");
+      expect(snapshot.version).toBe("1.0.78");
+      expect(snapshot.message).toBe(
+        `GitHub Copilot CLI v1.0.78 is too old. Upgrade to v${MINIMUM_COPILOT_CLI_VERSION} or newer.`,
+      );
+      expect(starts).toEqual([]);
+    }),
+  );
+
   it.effect("recognizes keychain-backed authentication and cleans up the SDK client", () =>
     Effect.gen(function* () {
       const starts: number[] = [];
@@ -144,7 +180,7 @@ describe("checkCopilotProviderStatus", () => {
       );
       expect(loggedOut.status).toBe("error");
       expect(loggedOut.auth.status).toBe("unauthenticated");
-      expect(loggedOut.message).toContain("copilot auth login");
+      expect(loggedOut.message).toContain("copilot login");
 
       const policyDenied = yield* checkCopilotProviderStatus(settings, {}, {}).pipe(
         Effect.provide(

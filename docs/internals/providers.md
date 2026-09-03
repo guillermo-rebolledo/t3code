@@ -52,6 +52,12 @@ launches the user's separately installed `copilot` executable over the stable fi
 `@github/copilot-sdk` stdio transport. The CLI continues to own credentials in the operating-system
 keychain or supported environment variables; T3 Code does not copy or persist them.
 
+The compatibility baseline is Copilot CLI 1.0.79 or newer, matching the oldest runtime declared by
+the pinned `@github/copilot-sdk` 1.0.11. The release-hardening pass tested CLI 1.0.82 with SDK 1.0.11.
+Provider discovery rejects an older CLI before starting the SDK and returns an upgrade instruction;
+runtime features never silently degrade around a missing protocol capability. Update this paragraph,
+the minimum-version constant, and the focused provider test together when the SDK is upgraded.
+
 The `CopilotSdkRuntime` service is the single test injection seam for SDK startup, cleanup,
 authentication, status, models, sessions, failures, and timeouts. Production resolves bare
 executable names against the provider-instance environment, Windows `PATHEXT`, and conservative GUI
@@ -59,12 +65,24 @@ install paths before opening stdio. A successful account inventory is authoritat
 entry is the live preferred default. Failed refreshes retain the last successful catalog, and no
 static model is invented.
 
+The server environment owns this process and its credential lookup in every connection mode. Web
+and desktop clients, direct remote clients, relay clients, and tunnel-connected mobile clients send
+the same typed requests to that server-owned instance; no client-side Copilot binary, token, or
+session is part of the provider contract.
+
 Each enabled provider instance owns one scoped SDK client and its own map of T3 thread ids to SDK
 sessions. The Copilot adapter maps SDK assistant, reasoning, tool, usage, and idle events onto
 canonical runtime events. Its thread snapshots retain the provider events grouped under the T3 turn
 that observed them. Stopping an instance disconnects all of its sessions before the SDK client scope
 closes. Attachments are accepted only after resolving a known T3 attachment id inside the configured
 attachment store.
+
+The instance's text-generation service uses that same scoped SDK client but creates a short-lived
+session for each title, branch, commit, or pull-request request. It resolves the requested model and
+options against the live account inventory, exposes an empty tool catalog, rejects every permission
+callback, and disconnects the session through scoped finalization on success, decoding failure,
+timeout, provider failure, or interruption. Output still passes through the shared structured-output
+decoders and operation-specific sanitizers before it reaches callers.
 
 Every Copilot turn settles through one path, so a turn emits `turn.completed` exactly once no matter
 which of interrupt, idle, runtime error, send failure, or session stop reaches it first. Native SDK
@@ -82,6 +100,33 @@ that fails the turn. A `session.shutdown` settles the visible turn, disconnects 
 reports one `session.exited` whose exit kind reflects whether Copilot crashed. Interrupting, a
 runtime shutdown, and a session stop all release the session's open approvals, and teardown also
 releases a send the runtime never answered, so nothing outlives the work that opened it.
+
+Commands and skills are workspace data, not machine data. `CopilotDriver.snapshotForCwd` reads them
+through the instance's existing SDK connection - `workspaceCommands` opens a throwaway session in
+that directory for Copilot's own command list, `workspaceSkills` discovers the project's skills -
+and the registry files the result under that `cwd`. Neither read can fail the caller: a refused or
+hanging discovery costs the user the catalog for one directory and nothing else, and the
+instance-wide snapshot advertises no commands or skills at all. Malformed skill entries are dropped
+individually, and a source T3 does not recognise is published without a scope rather than under a
+guessed one.
+
+The composer writes a skill pick as `$name`, which Copilot does not read. `rewriteCopilotSkillMentions`
+turns every mention naming an advertised command into `/name` before routing, so a lone pick invokes
+the skill through the command RPC and a mention inside prose reaches the agent as command text it can
+act on itself; a mention Copilot never advertised is left verbatim. The two command reads differ on
+skills deliberately: the published catalog omits them, because Copilot repeats every user-invocable
+skill as a command and the client already drops those rows in favour of the skill entry (142 commands
+against 32 on one real inventory), while the live session's routing set includes them so those names
+stay invocable.
+
+A turn whose prompt names a command the session advertised is invoked through `commands.invoke`;
+everything else, including slash text naming a command Copilot did not advertise, goes out through
+`send` unchanged. Commands T3 Code owns through its own interface - `model`, `plan`, `default` -
+never reach the catalog, so they cannot be routed either. A command that answers with an agent
+prompt becomes that turn's message and settles through the normal event path; one that answers
+directly is rendered as a single assistant message and settles the turn on the spot, because it
+produces no session events of its own. A refused invocation fails the turn exactly once, through the
+same settlement path as a refused send.
 
 ### Grok health check
 

@@ -1,5 +1,6 @@
 import type { CopilotSettings, ServerProviderAuth, ServerProviderModel } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as DateTime from "effect/DateTime";
 import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -28,6 +29,9 @@ const VERSION_TIMEOUT = "8 seconds";
 const SDK_TIMEOUT = "10 seconds";
 const POLICY_FAILURE_PATTERN = /policy|entitlement|forbidden|organization|403/iu;
 
+/** Oldest Copilot runtime supported by the pinned @github/copilot-sdk. */
+export const MINIMUM_COPILOT_CLI_VERSION = "1.0.79";
+
 export type CopilotVersionResult =
   | { readonly kind: "ready"; readonly version: string }
   | { readonly kind: "missing" | "failed" | "unrecognized"; readonly message: string };
@@ -40,7 +44,7 @@ export function parseCopilotVersionOutput(result: CommandResult): CopilotVersion
       return {
         kind: "missing",
         message:
-          "GitHub Copilot CLI is not installed or not on PATH. Install it, then run `copilot auth login`.",
+          "GitHub Copilot CLI is not installed or not on PATH. Install it, then run `copilot login`.",
       };
     }
     return {
@@ -56,6 +60,39 @@ export function parseCopilotVersionOutput(result: CommandResult): CopilotVersion
         message:
           "The configured executable did not return recognizable GitHub Copilot CLI version output.",
       };
+}
+
+export const inspectCopilotCliVersion = Effect.fn("inspectCopilotCliVersion")(function* (
+  binaryPath: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Effect.fn.Return<CopilotVersionResult, never, ChildProcessSpawner.ChildProcessSpawner> {
+  const versionResult = yield* versionCommand(binaryPath, environment).pipe(
+    Effect.timeoutOption(VERSION_TIMEOUT),
+    Effect.result,
+  );
+  if (Result.isFailure(versionResult)) {
+    const missing = isCommandMissingCause(versionResult.failure);
+    return {
+      kind: missing ? "missing" : "failed",
+      message: missing
+        ? "GitHub Copilot CLI is not installed or not on PATH. Install it, then run `copilot login`."
+        : "GitHub Copilot CLI failed before its version could be checked.",
+    };
+  }
+  if (versionResult.success._tag === "None") {
+    return {
+      kind: "failed",
+      message: "GitHub Copilot CLI timed out while reporting its version.",
+    };
+  }
+  return parseCopilotVersionOutput(versionResult.success.value);
+});
+
+export function copilotCliCompatibilityIssue(result: CopilotVersionResult): string | undefined {
+  if (result.kind !== "ready") return result.message;
+  return compareSemverVersions(result.version, MINIMUM_COPILOT_CLI_VERSION) < 0
+    ? `GitHub Copilot CLI v${result.version} is too old. Upgrade to v${MINIMUM_COPILOT_CLI_VERSION} or newer.`
+    : undefined;
 }
 
 const versionCommand = Effect.fn("versionCommand")(function* (
@@ -185,39 +222,7 @@ export const checkCopilotProviderStatus = Effect.fn("checkCopilotProviderStatus"
     });
   }
 
-  const versionResult = yield* versionCommand(settings.binaryPath, environment).pipe(
-    Effect.timeoutOption(VERSION_TIMEOUT),
-    Effect.result,
-  );
-  if (Result.isFailure(versionResult)) {
-    const missing = isCommandMissingCause(versionResult.failure);
-    return snapshot({
-      settings,
-      checkedAt,
-      installed: !missing,
-      version: null,
-      status: "error",
-      auth: { status: "unknown" },
-      models: previousModels,
-      message: missing
-        ? "GitHub Copilot CLI is not installed or not on PATH. Install it, then run `copilot auth login`."
-        : "GitHub Copilot CLI failed before its version could be checked.",
-    });
-  }
-  if (Option.isNone(versionResult.success)) {
-    return snapshot({
-      settings,
-      checkedAt,
-      installed: true,
-      version: null,
-      status: "error",
-      auth: { status: "unknown" },
-      models: previousModels,
-      message: "GitHub Copilot CLI timed out while reporting its version.",
-    });
-  }
-
-  const parsed = parseCopilotVersionOutput(versionResult.success.value);
+  const parsed = yield* inspectCopilotCliVersion(settings.binaryPath, environment);
   if (parsed.kind !== "ready") {
     return snapshot({
       settings,
@@ -228,6 +233,20 @@ export const checkCopilotProviderStatus = Effect.fn("checkCopilotProviderStatus"
       auth: { status: "unknown" },
       models: previousModels,
       message: parsed.message,
+    });
+  }
+
+  const compatibilityIssue = copilotCliCompatibilityIssue(parsed);
+  if (compatibilityIssue) {
+    return snapshot({
+      settings,
+      checkedAt,
+      installed: true,
+      version: parsed.version,
+      status: "error",
+      auth: { status: "unknown" },
+      models: previousModels,
+      message: compatibilityIssue,
     });
   }
 
@@ -304,7 +323,7 @@ export const checkCopilotProviderStatus = Effect.fn("checkCopilotProviderStatus"
       models: previousModels,
       message: policyFailure
         ? `GitHub Copilot access was rejected by organization policy or account entitlement: ${account.auth.statusMessage}`
-        : "GitHub Copilot is not authenticated. Run `copilot auth login` on this environment.",
+        : "GitHub Copilot is not authenticated. Run `copilot login` on this environment.",
     });
   }
 
