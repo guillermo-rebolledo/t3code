@@ -1,3 +1,4 @@
+import type { ModelInfo, SessionEvent } from "@github/copilot-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
@@ -83,8 +84,42 @@ const runtime: CopilotSdkRuntimeShape = {
   connect: () =>
     Effect.succeed({
       authStatus: unused("authStatus"),
-      models: unused("models"),
-      createSession: () => unused("createSession"),
+      models: Effect.succeed([
+        {
+          id: "gpt-5.4",
+          name: "GPT-5.4",
+          capabilities: { supports: {} },
+        } as ModelInfo,
+      ]),
+      createSession: (input) =>
+        Effect.succeed({
+          sessionId: "aux-session",
+          send: () =>
+            Effect.sync(() => {
+              input.onEvent({
+                id: "message-event",
+                parentId: null,
+                timestamp: "2026-01-01T00:00:00.000Z",
+                type: "assistant.message",
+                data: { messageId: "message-1", content: '{"title":"Copilot helper"}' },
+              } as SessionEvent);
+              input.onEvent({
+                id: "idle-event",
+                parentId: "message-event",
+                timestamp: "2026-01-01T00:00:00.000Z",
+                type: "session.idle",
+                data: {},
+              } as SessionEvent);
+              return "message-1";
+            }),
+          abort: Effect.void,
+          setModel: () => Effect.void,
+          listCommands: Effect.succeed([]),
+          invokeCommand: () => unused("invokeCommand"),
+          rewindPoints: Effect.succeed({ points: [] }),
+          rewind: () => unused("rewind"),
+          disconnect: Effect.void,
+        }),
       resumeSession: () => unused("resumeSession"),
       workspaceCommands: (cwd) => Effect.succeed(workspaces[cwd]?.commands ?? []),
       workspaceSkills: (cwd) => Effect.succeed(workspaces[cwd]?.skills ?? []),
@@ -137,6 +172,29 @@ it.layer(testLayer)("CopilotDriver workspace snapshots", (it) => {
         worktree.skills.map((skill) => skill.name),
         ["worktree-deploy"],
       );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("provides auxiliary text generation for enabled instances", () =>
+    Effect.gen(function* () {
+      const instance = yield* CopilotDriver.create({
+        instanceId: ProviderInstanceId.make("copilot_work"),
+        displayName: "Copilot Work",
+        environment: [],
+        enabled: true,
+        config: { enabled: true, binaryPath: "/nonexistent/copilot" },
+      });
+
+      const generated = yield* instance.textGeneration.generateThreadTitle({
+        cwd: "/repo/app",
+        message: "Add Copilot text generation",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("copilot_work"),
+          model: "gpt-5.4",
+        },
+      });
+
+      assert.deepEqual(generated, { title: "Copilot helper" });
     }).pipe(Effect.scoped),
   );
 });

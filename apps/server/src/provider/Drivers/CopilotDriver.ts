@@ -17,6 +17,7 @@ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
+import { makeCopilotTextGeneration } from "../../textGeneration/CopilotTextGeneration.ts";
 import type { CopilotSdkConnection } from "../CopilotSdkRuntime.ts";
 import { CopilotSdkRuntime } from "../CopilotSdkRuntime.ts";
 import { discoverCopilotWorkspaceCapabilities } from "../CopilotWorkspace.ts";
@@ -132,9 +133,9 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies CopilotSettings;
-      // The instance's one SDK connection serves both its adapter and its
-      // per-workspace command and skill reads, so discovery never starts a
-      // second Copilot process behind the running one.
+      // The instance's one SDK connection serves its adapter, auxiliary text
+      // generation, and per-workspace capability reads, so none of those paths
+      // starts a second Copilot process behind the running one.
       const connection: CopilotSdkConnection | undefined = enabled
         ? yield* runtime
             .connect({
@@ -160,6 +161,9 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
             ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
           })
         : discoveryOnlyAdapter();
+      const textGeneration = connection
+        ? makeCopilotTextGeneration(connection)
+        : discoveryOnlyTextGeneration();
       const lastModels = yield* Ref.make<ReadonlyArray<ServerProviderModel>>([]);
       const checkProvider = checkCopilotProviderStatus(effectiveConfig, processEnv, {
         lastModels,
@@ -215,7 +219,7 @@ export const CopilotDriver: ProviderDriver<CopilotSettings, CopilotDriverEnv> = 
         snapshot,
         snapshotForCwd,
         adapter,
-        textGeneration: discoveryOnlyTextGeneration(),
+        textGeneration,
       } satisfies ProviderInstance;
     }),
 };

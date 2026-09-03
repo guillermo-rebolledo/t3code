@@ -66,6 +66,13 @@ that observed them. Stopping an instance disconnects all of its sessions before 
 closes. Attachments are accepted only after resolving a known T3 attachment id inside the configured
 attachment store.
 
+The instance's text-generation service uses that same scoped SDK client but creates a short-lived
+session for each title, branch, commit, or pull-request request. It resolves the requested model and
+options against the live account inventory, exposes an empty tool catalog, rejects every permission
+callback, and disconnects the session through scoped finalization on success, decoding failure,
+timeout, provider failure, or interruption. Output still passes through the shared structured-output
+decoders and operation-specific sanitizers before it reaches callers.
+
 Every Copilot turn settles through one path, so a turn emits `turn.completed` exactly once no matter
 which of interrupt, idle, runtime error, send failure, or session stop reaches it first. Native SDK
 events are tagged with the turn that was live when the runtime emitted them, so events trailing a
