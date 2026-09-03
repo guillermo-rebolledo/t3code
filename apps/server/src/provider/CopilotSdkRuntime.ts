@@ -385,8 +385,10 @@ const makeCopilotSdkRuntime: CopilotSdkRuntimeShape = {
           (session) => session.disconnect(),
         ).pipe(Effect.map(wrapSession)),
       resumeSession: (input) =>
-        interruptibleSdkEffect("resumeSession", () =>
-          client.resumeSession(input.sessionId, sessionConfig(input)),
+        interruptibleSdkEffect(
+          "resumeSession",
+          () => client.resumeSession(input.sessionId, sessionConfig(input)),
+          (session) => session.disconnect(),
         ).pipe(Effect.map(wrapSession)),
       workspaceCommands: (cwd) =>
         interruptibleSdkEffect("workspaceCommands", async () => {
