@@ -476,6 +476,175 @@ it.layer(testLayer)("CopilotAdapter", (it) => {
     }),
   );
 
+  it.effect("rejects callbacks from a replaced SDK session without touching its successor", () =>
+    Effect.gen(function* () {
+      const createInputs: Array<CopilotSdkSessionStartInput> = [];
+      const runtime = runtimeWith((input) => {
+        createInputs.push(input);
+        return Effect.succeed(fakeSession(`replacement-session-${createInputs.length}`));
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("replaced-session-thread");
+      const observer = yield* observeEvents(adapter);
+
+      yield* adapter.startSession({
+        ...startInput(threadId, ProviderInstanceId.make("copilot")),
+        runtimeMode: "approval-required",
+      });
+      const firstInput = createInputs[0]!;
+      yield* adapter.startSession({
+        ...startInput(threadId, ProviderInstanceId.make("copilot")),
+        runtimeMode: "approval-required",
+      });
+      const secondInput = createInputs[1]!;
+      const turn = yield* adapter.sendTurn({ threadId, input: "Use the replacement session" });
+
+      firstInput.onEvent(
+        event({
+          type: "assistant.message",
+          data: { messageId: "stale-message", content: "stale output" },
+        }),
+      );
+      firstInput.onEvent(event({ type: "session.idle", data: {} }));
+      const stalePermissionFiber = yield* Effect.promise(() =>
+        firstInput.onPermissionRequest({
+          kind: "shell",
+          fullCommandText: "echo stale",
+          intention: "Run stale work",
+          commands: [{ identifier: "echo", readOnly: true }],
+          canOfferSessionApproval: true,
+        }),
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+
+      secondInput.onEvent(
+        event({
+          type: "assistant.message",
+          data: { messageId: "current-message", content: "current output" },
+        }),
+      );
+      secondInput.onEvent(event({ type: "session.idle", data: {} }));
+      yield* observer.until(
+        (runtimeEvent) =>
+          runtimeEvent.type === "turn.completed" && runtimeEvent.turnId === turn.turnId,
+      );
+      const snapshot = yield* adapter.readThread(threadId);
+      yield* adapter.stopSession(threadId);
+      const stalePermission = yield* Fiber.join(stalePermissionFiber);
+
+      assert.deepEqual(stalePermission, { kind: "reject" });
+      assert.notInclude(
+        observer.seen.map((runtimeEvent) => runtimeEvent.type),
+        "request.opened",
+      );
+      assert.deepEqual(
+        observer.seen
+          .filter((runtimeEvent) => runtimeEvent.type === "content.delta")
+          .map((runtimeEvent) => runtimeEvent.payload.delta),
+        ["current output"],
+      );
+      assert.equal(
+        observer.seen.filter((runtimeEvent) => runtimeEvent.type === "turn.completed").length,
+        1,
+      );
+      assert.deepEqual(
+        snapshot.turns[0]?.items.map((item) => (item as SessionEvent).type),
+        ["assistant.message", "session.idle"],
+      );
+    }),
+  );
+
+  it.effect("disconnects session starts superseded by another start or stopAll", () =>
+    Effect.gen(function* () {
+      const firstStarted = yield* Deferred.make<void>();
+      const secondStarted = yield* Deferred.make<void>();
+      const firstSession = yield* Deferred.make<CopilotSdkSession>();
+      const secondSession = yield* Deferred.make<CopilotSdkSession>();
+      let createCount = 0;
+      let secondDisconnects = 0;
+      const runtime = runtimeWith(() => {
+        createCount += 1;
+        return createCount === 1
+          ? Deferred.succeed(firstStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(firstSession)),
+            )
+          : Deferred.succeed(secondStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(secondSession)),
+            );
+      });
+      const adapter = yield* makeTestAdapter(runtime);
+      const threadId = ThreadId.make("concurrent-start-thread");
+      const first = yield* adapter
+        .startSession(startInput(threadId, ProviderInstanceId.make("copilot")))
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(firstStarted);
+      const second = yield* adapter
+        .startSession(startInput(threadId, ProviderInstanceId.make("copilot")))
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(secondStarted);
+
+      yield* Deferred.succeed(
+        secondSession,
+        fakeSession("current-session", { onDisconnect: () => (secondDisconnects += 1) }),
+      );
+      assert.equal((yield* Fiber.join(second))._tag, "Success");
+      assert.equal((yield* Fiber.join(first))._tag, "Failure");
+      assert.equal(secondDisconnects, 0);
+      assert.deepEqual(
+        (yield* adapter.listSessions()).map((session) => session.resumeCursor),
+        [
+          buildCopilotContinuation({
+            instanceId: ProviderInstanceId.make("copilot"),
+            sessionId: "current-session",
+          }),
+        ],
+      );
+
+      const stoppedStarted = yield* Deferred.make<void>();
+      let stoppedStartFinalized = false;
+      const stoppedRuntime = runtimeWith(() =>
+        Deferred.succeed(stoppedStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Effect.sync(() => (stoppedStartFinalized = true))),
+        ),
+      );
+      const stoppedAdapter = yield* makeTestAdapter(stoppedRuntime);
+      const stoppedThread = ThreadId.make("stopped-start-thread");
+      const stopped = yield* stoppedAdapter
+        .startSession(startInput(stoppedThread, ProviderInstanceId.make("copilot")))
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(stoppedStarted);
+      yield* stoppedAdapter.stopAll();
+      assert.isTrue(stoppedStartFinalized);
+      assert.equal((yield* Fiber.join(stopped))._tag, "Failure");
+      assert.isFalse(yield* stoppedAdapter.hasSession(stoppedThread));
+
+      const commandListStarted = yield* Deferred.make<void>();
+      let acquiredDisconnects = 0;
+      const acquiredRuntime = runtimeWith(() =>
+        Effect.succeed(
+          fakeSession("acquired-session", {
+            listCommands: Deferred.succeed(commandListStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+            ),
+            onDisconnect: () => (acquiredDisconnects += 1),
+          }),
+        ),
+      );
+      const acquiredAdapter = yield* makeTestAdapter(acquiredRuntime);
+      const acquiredThread = ThreadId.make("acquired-start-thread");
+      const acquired = yield* acquiredAdapter
+        .startSession(startInput(acquiredThread, ProviderInstanceId.make("copilot")))
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(commandListStarted);
+      yield* acquiredAdapter.stopAll();
+
+      assert.equal(acquiredDisconnects, 1);
+      assert.equal((yield* Fiber.join(acquired))._tag, "Failure");
+      assert.isFalse(yield* acquiredAdapter.hasSession(acquiredThread));
+    }),
+  );
+
   it.effect("honors file, shell, and generic approvals across every runtime mode", () =>
     Effect.gen(function* () {
       const createInputs: Array<CopilotSdkSessionStartInput> = [];
